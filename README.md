@@ -12,58 +12,115 @@
 
 # Claude Ninja
 
-Sharp, fast, and focused mission control for your AI coding agents.
+Project-first, manager-driven workspace for running multiple AI coding agents safely and fast.
 
 [![GitHub Stars](https://img.shields.io/github/stars/pratham-bhatnagar/claude-ninja?style=for-the-badge&logo=github&color=yellow&labelColor=1a1b26)](https://github.com/pratham-bhatnagar/claude-ninja/stargazers)
 [![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?style=for-the-badge&logo=go&labelColor=1a1b26)](https://go.dev)
 [![License](https://img.shields.io/badge/License-MIT-9ece6a?style=for-the-badge&labelColor=1a1b26)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20WSL-7aa2f7?style=for-the-badge&labelColor=1a1b26)](https://github.com/pratham-bhatnagar/claude-ninja)
-[![Latest Release](https://img.shields.io/github/v/release/pratham-bhatnagar/claude-ninja?style=for-the-badge&color=e0af68&labelColor=1a1b26)](https://github.com/pratham-bhatnagar/claude-ninja/releases)
+[![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20WSL-7aa2f7?style=for-the-badge&labelColor=1a1b26)](#)
 
-[Features](#features) . [Quick Start](#quick-start) . [Roadmap](#roadmap) . [License](#license)
+[Features](#features) · [Installation](#installation) · [Quick Start](#quick-start) · [Usage](#usage) · [Contributing](#contributing) · [Roadmap](#roadmap) · [License](#license)
 
 </div>
 
 ## Overview
 
-Claude Ninja is a nimble TUI that keeps all your AI coding sessions in one clean, lightning-fast workspace. See everything at a glance, switch instantly, and keep projects organized without tab chaos.
+Claude Ninja keeps every agent isolated in its own branch/worktree, routes all sub-agent output through a single Manager, and provides a focused TUI to plan, execute, and verify work across projects.
 
-- See status for every agent at once (running, waiting, idle)
-- Fork conversations to explore different approaches without losing context
-- Attach and manage MCP servers per project or globally
-- Fuzzy-search across sessions and jump in milliseconds
-- Use git worktrees to isolate branches per agent
+- Project-first TUI: switch projects with Left/Right; browse sub-agents with Up/Down
+- Manager-only interaction: reply once in the Manager; aggregate sub-agent output there
+- Worktree isolation: each agent works on its own branch/worktree for safe concurrency
+- Structured planning: GSD-style plan/execute/verify via lightweight `.planning/` state
+- Nudging loop: surface waiting agents to the Manager to keep flow unblocked
 
 ## Features
 
-- Fork sessions with full context inheritance
-- Toggle MCP servers with a built-in manager
-- Socket pooling for efficient MCP usage
-- Tmux-integrated notification bar for waiting sessions
-- Smart status detection and global search
+- Multi-project navigation and global search
+- Manager panel with status, waiting agents, and planning commands
+- Session forking and context inheritance
+- Git worktree helpers for isolated branches
+- Optional MCP integrations and pooling (where available)
+
+## Installation
+
+Prerequisites: Go 1.24+, git, tmux.
+
+From source:
+
+```bash
+make build            # Build to ./build
+make install          # Install to /usr/local/bin (sudo)
+# or
+make install-user     # Install to ~/.local/bin (no sudo)
+```
+
+Note: The current binary name in Makefile is `agent-deck` during migration. After install, run `agent-deck` to launch. The CLI will be renamed to `claude-ninja` in an upcoming update.
 
 ## Quick Start
 
-This repository is in an active rebrand. The installed binary and some file paths may still use the previous name while the codebase migrates.
+```bash
+# Launch the TUI
+agent-deck
+
+# Create/import sessions per project, then mark your Manager with "!"
+# Send a sub-agent’s output to the Manager with "x"
+```
+
+## Usage
+
+Core workflow:
+
+- Create or import sessions per project
+- Mark a Manager session: select and press `!`
+- Switch projects with Left/Right; navigate sessions with Up/Down
+- Press `x` on a sub-agent to send its output to the Manager
+- Use the Manager to plan, execute, verify, and merge
+
+GSD-style planning commands (run from the Manager):
+
+- `/gsd:new-project` initialize goals and context
+- `/gsd:plan-phase 1` draft a structured plan
+- `/gsd:execute-phase 1` run sub-agents for phase 1
+- `/gsd:verify-work 1` verify outputs against code
+
+Key shortcuts:
+
+- Left/Right: switch projects
+- Up/Down: navigate sessions
+- `!`: mark/unmark Manager session
+- `x`: send sub-agent output to Manager
+- `v`: cycle right pane (Manager / Both / Output / Stats)
+
+## Contributing
+
+We’d love your help! Ways to contribute:
+
+- Triage issues and propose improvements
+- Implement features from the Roadmap
+- Improve docs and examples in `docs/` and `demos/`
+
+Development setup:
 
 ```bash
-make build    # Build
-make test     # Test
+make test     # Run tests
+make fmt      # Format code
 make lint     # Lint
-
-# Run the TUI (current binary name may still be `agent-deck`)
-agent-deck
 ```
+
+Please read CONTRIBUTING.md before opening a PR. If proposing larger changes, open a discussion/issue first for alignment.
+
+Security: If you discover a vulnerability, please open a private security advisory on GitHub rather than filing a public issue.
 
 ## Roadmap
 
-- Rename binary and config paths to `claude-ninja`
-- Update installers and Homebrew formula
-- Refresh docs and examples under `docs/`
+- Rename binary/paths to `claude-ninja`
+- Update installers and package distribution
+- Expand docs (configuration, MCP, worktrees)
+- Starter templates and example projects
 
 ## License
 
-MIT License — see [LICENSE](LICENSE)
+MIT License — see LICENSE.
 
 ---
 
