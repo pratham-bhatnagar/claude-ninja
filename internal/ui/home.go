@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -17,11 +18,11 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
 
-	"github.com/asheshgoplani/agent-deck/internal/clipboard"
-	"github.com/asheshgoplani/agent-deck/internal/git"
-	"github.com/asheshgoplani/agent-deck/internal/session"
-	"github.com/asheshgoplani/agent-deck/internal/tmux"
-	"github.com/asheshgoplani/agent-deck/internal/update"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/clipboard"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/git"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/session"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/tmux"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/update"
 )
 
 // Version is set by main.go for update checking
@@ -58,6 +59,13 @@ const (
 	// analyticsCacheTTL - how long analytics data remains valid before refresh
 	// Analytics don't change frequently, so 5s is a good balance between freshness and performance
 	analyticsCacheTTL = 5 * time.Second
+
+	// nudgeInterval - how often to prompt the manager about waiting agents
+	nudgeInterval = 60 * time.Second
+	// nudgeThreshold - minimum wait time before an agent is considered stalled
+	nudgeThreshold = 30 * time.Second
+
+	orchestratorTitle = "Orchestrator"
 )
 
 // UI spacing constants (2-char grid system)
@@ -92,10 +100,22 @@ const (
 type PreviewMode int
 
 const (
-	PreviewModeBoth      PreviewMode = iota // Show both analytics and output (default)
+	PreviewModeManager   PreviewMode = iota // Orchestrator panel (default)
+	PreviewModeBoth                         // Show both analytics and output
 	PreviewModeOutput                       // Show output only (content preview)
 	PreviewModeAnalytics                    // Show analytics only
 )
+
+// projectInfo represents a project grouping for the UI project bar.
+type projectInfo struct {
+	Key          string
+	Name         string
+	Path         string
+	SessionCount int
+	WaitingCount int
+	RunningCount int
+	LastActivity time.Time
+}
 
 // Responsive breakpoints for empty state content tiers
 // These define when to show full/compact/minimal content
@@ -127,6 +147,10 @@ type Home struct {
 	storage      *session.Storage
 	groupTree    *session.GroupTree
 	flatItems    []session.Item // Flattened view for cursor navigation
+
+	// Project UI
+	projectList  []projectInfo
+	projectIndex int
 
 	// Components
 	search              *Search
@@ -191,7 +215,7 @@ type Home struct {
 	// PERFORMANCE: Worker pool for log-driven status updates (Priority 2)
 	// Caps the number of goroutines spawned for log file changes
 	logUpdateChan chan *session.Instance // Buffers status update requests from LogWatcher
-	logWorkerWg   sync.WaitGroup       // Tracks log worker goroutines for clean shutdown
+	logWorkerWg   sync.WaitGroup         // Tracks log worker goroutines for clean shutdown
 
 	// Event-driven status detection (Priority 2)
 	logWatcher *tmux.LogWatcher
@@ -208,6 +232,10 @@ type Home struct {
 
 	// Update notification (async check on startup)
 	updateInfo *update.UpdateInfo
+
+	// Verification cache (per project)
+	verificationCache     map[string]string
+	verificationCacheTime map[string]time.Time
 
 	// Launching animation state (for newly created sessions)
 	launchingSessions  map[string]time.Time // sessionID -> creation time
@@ -233,6 +261,11 @@ type Home struct {
 
 	// Vi-style gg to jump to top (#38)
 	lastGTime time.Time // When 'g' was last pressed (double-tap within 500ms jumps to top)
+
+	// Nudging loop for waiting agents
+	lastNudgeAtProject  map[string]time.Time // projectKey -> last nudge time
+	lastNudgeAtSession  map[string]time.Time // sessionID -> last nudge time
+	orchestratorPending map[string]bool
 
 	// Navigation tracking (PERFORMANCE: suspend background updates during rapid navigation)
 	lastNavigationTime time.Time // When user last navigated (up/down/j/k)
@@ -392,6 +425,10 @@ type sendOutputResultMsg struct {
 	err         error
 }
 
+type popupOpenedMsg struct {
+	err error
+}
+
 // statusUpdateRequest is sent to the background worker with current viewport info
 type statusUpdateRequest struct {
 	viewOffset    int      // Current scroll position
@@ -433,45 +470,51 @@ func NewHomeWithProfileAndMode(profile string, isPrimary bool) *Home {
 	}
 
 	h := &Home{
-		profile:              actualProfile,
-		storage:              storage,
-		storageWarning:       storageWarning,
-		search:               NewSearch(),
-		newDialog:            NewNewDialog(),
-		groupDialog:          NewGroupDialog(),
-		forkDialog:           NewForkDialog(),
-		confirmDialog:        NewConfirmDialog(),
-		helpOverlay:          NewHelpOverlay(),
-		mcpDialog:            NewMCPDialog(),
-		setupWizard:          NewSetupWizard(),
-		settingsPanel:        NewSettingsPanel(),
-		analyticsPanel:       NewAnalyticsPanel(),
-		geminiModelDialog:    NewGeminiModelDialog(),
-		sessionPickerDialog:  NewSessionPickerDialog(),
-		cursor:               0,
-		initialLoading:       true, // Show splash until sessions load
-		ctx:                  ctx,
-		cancel:               cancel,
-		instances:            []*session.Instance{},
-		instanceByID:         make(map[string]*session.Instance),
-		groupTree:            session.NewGroupTree([]*session.Instance{}),
-		flatItems:            []session.Item{},
-		previewCache:         make(map[string]string),
-		previewCacheTime:     make(map[string]time.Time),
-		analyticsCache:       make(map[string]*session.SessionAnalytics),
-		geminiAnalyticsCache: make(map[string]*session.GeminiSessionAnalytics),
-		analyticsCacheTime:   make(map[string]time.Time),
-		launchingSessions:    make(map[string]time.Time),
-		resumingSessions:     make(map[string]time.Time),
-		mcpLoadingSessions:   make(map[string]time.Time),
-		forkingSessions:      make(map[string]time.Time),
-		lastLogActivity:      make(map[string]time.Time),
-		statusTrigger:        make(chan statusUpdateRequest, 1), // Buffered to avoid blocking
-		statusWorkerDone:     make(chan struct{}),
-		logUpdateChan:        make(chan *session.Instance, 100), // Buffered to absorb bursts
-		boundKeys:            make(map[string]string),
-		isPrimaryInstance:    isPrimary,
-		undoStack:            make([]deletedSessionEntry, 0, 10),
+		profile:               actualProfile,
+		storage:               storage,
+		storageWarning:        storageWarning,
+		search:                NewSearch(),
+		newDialog:             NewNewDialog(),
+		groupDialog:           NewGroupDialog(),
+		forkDialog:            NewForkDialog(),
+		confirmDialog:         NewConfirmDialog(),
+		helpOverlay:           NewHelpOverlay(),
+		mcpDialog:             NewMCPDialog(),
+		setupWizard:           NewSetupWizard(),
+		settingsPanel:         NewSettingsPanel(),
+		analyticsPanel:        NewAnalyticsPanel(),
+		geminiModelDialog:     NewGeminiModelDialog(),
+		sessionPickerDialog:   NewSessionPickerDialog(),
+		cursor:                0,
+		initialLoading:        true, // Show splash until sessions load
+		ctx:                   ctx,
+		cancel:                cancel,
+		instances:             []*session.Instance{},
+		instanceByID:          make(map[string]*session.Instance),
+		groupTree:             session.NewGroupTree([]*session.Instance{}),
+		flatItems:             []session.Item{},
+		previewCache:          make(map[string]string),
+		previewCacheTime:      make(map[string]time.Time),
+		analyticsCache:        make(map[string]*session.SessionAnalytics),
+		geminiAnalyticsCache:  make(map[string]*session.GeminiSessionAnalytics),
+		analyticsCacheTime:    make(map[string]time.Time),
+		verificationCache:     make(map[string]string),
+		verificationCacheTime: make(map[string]time.Time),
+		launchingSessions:     make(map[string]time.Time),
+		resumingSessions:      make(map[string]time.Time),
+		mcpLoadingSessions:    make(map[string]time.Time),
+		forkingSessions:       make(map[string]time.Time),
+		lastLogActivity:       make(map[string]time.Time),
+		statusTrigger:         make(chan statusUpdateRequest, 1), // Buffered to avoid blocking
+		statusWorkerDone:      make(chan struct{}),
+		logUpdateChan:         make(chan *session.Instance, 100), // Buffered to absorb bursts
+		boundKeys:             make(map[string]string),
+		isPrimaryInstance:     isPrimary,
+		undoStack:             make([]deletedSessionEntry, 0, 10),
+		previewMode:           PreviewModeManager,
+		lastNudgeAtProject:    make(map[string]time.Time),
+		lastNudgeAtSession:    make(map[string]time.Time),
+		orchestratorPending:   make(map[string]bool),
 	}
 
 	// Initialize notification manager if enabled in config
@@ -673,46 +716,53 @@ func (h *Home) restoreState(state reloadState) {
 
 // rebuildFlatItems rebuilds the flattened view from group tree
 func (h *Home) rebuildFlatItems() {
+	h.refreshProjectList()
 	allItems := h.groupTree.Flatten()
 
-	// Apply status filter if active
-	if h.statusFilter != "" {
-		// First pass: identify groups that have matching sessions
-		groupsWithMatches := make(map[string]bool)
-		for _, item := range allItems {
-			if item.Type == session.ItemTypeSession && item.Session != nil {
-				if item.Session.Status == h.statusFilter {
-					// Mark this session's group and all parent groups as having matches
-					groupsWithMatches[item.Path] = true
-					// Also mark parent paths
-					parts := strings.Split(item.Path, "/")
-					for i := range parts {
-						parentPath := strings.Join(parts[:i+1], "/")
-						groupsWithMatches[parentPath] = true
-					}
-				}
-			}
+	projectKey := h.currentProjectKey()
+	matchesSession := func(inst *session.Instance) bool {
+		if inst == nil {
+			return false
 		}
-
-		// Second pass: filter items
-		filtered := make([]session.Item, 0, len(allItems))
-		for _, item := range allItems {
-			if item.Type == session.ItemTypeGroup {
-				// Keep group if it has matching sessions
-				if groupsWithMatches[item.Path] {
-					filtered = append(filtered, item)
-				}
-			} else if item.Type == session.ItemTypeSession && item.Session != nil {
-				// Keep session if it matches the filter
-				if item.Session.Status == h.statusFilter {
-					filtered = append(filtered, item)
-				}
-			}
+		if projectKey != "" && projectKeyForInstance(inst) != projectKey {
+			return false
 		}
-		h.flatItems = filtered
-	} else {
-		h.flatItems = allItems
+		if h.statusFilter != "" && inst.Status != h.statusFilter {
+			return false
+		}
+		return true
 	}
+
+	// First pass: identify groups that have matching sessions
+	groupsWithMatches := make(map[string]bool)
+	for _, item := range allItems {
+		if item.Type == session.ItemTypeSession && item.Session != nil {
+			if matchesSession(item.Session) {
+				// Mark this session's group and all parent groups as having matches
+				groupsWithMatches[item.Path] = true
+				parts := strings.Split(item.Path, "/")
+				for i := range parts {
+					parentPath := strings.Join(parts[:i+1], "/")
+					groupsWithMatches[parentPath] = true
+				}
+			}
+		}
+	}
+
+	// Second pass: filter items
+	filtered := make([]session.Item, 0, len(allItems))
+	for _, item := range allItems {
+		if item.Type == session.ItemTypeGroup {
+			if groupsWithMatches[item.Path] {
+				filtered = append(filtered, item)
+			}
+		} else if item.Type == session.ItemTypeSession && item.Session != nil {
+			if matchesSession(item.Session) {
+				filtered = append(filtered, item)
+			}
+		}
+	}
+	h.flatItems = filtered
 
 	// Pre-compute root group numbers for O(1) hotkey lookup (replaces O(n) loop in renderGroupItem)
 	rootNum := 0
@@ -756,6 +806,10 @@ func (h *Home) syncViewport() {
 	// Panel content: contentHeight - 2 lines
 	helpBarHeight := 2
 	panelTitleLines := 2 // SESSIONS title + underline (matches View())
+	projectBarHeight := 0
+	if len(h.projectList) > 0 {
+		projectBarHeight = 1
+	}
 
 	// Filter bar is always shown for consistent layout (matches View())
 	filterBarHeight := 1
@@ -784,14 +838,14 @@ func (h *Home) syncViewport() {
 		if listHeight < 5 {
 			listHeight = 5
 		}
-		panelContentHeight = listHeight - panelTitleLines
+		panelContentHeight = listHeight - panelTitleLines - projectBarHeight
 	case LayoutModeSingle:
 		// Single column: list gets full height minus title
 		// Must match: listHeight := totalHeight - 2
-		panelContentHeight = contentHeight - panelTitleLines
+		panelContentHeight = contentHeight - panelTitleLines - projectBarHeight
 	default: // LayoutModeDual
 		// Dual layout: list panel gets full contentHeight minus title
-		panelContentHeight = contentHeight - panelTitleLines
+		panelContentHeight = contentHeight - panelTitleLines - projectBarHeight
 	}
 
 	// maxVisible = how many items can be shown (reserving 1 for "more below" indicator)
@@ -982,6 +1036,10 @@ func (h *Home) getVisibleHeight() int {
 	helpBarHeight := 2
 	panelTitleLines := 2
 	filterBarHeight := 1
+	projectBarHeight := 0
+	if len(h.projectList) > 0 {
+		projectBarHeight = 1
+	}
 	updateBannerHeight := 0
 	if h.updateInfo != nil && h.updateInfo.Available {
 		updateBannerHeight = 1
@@ -1001,11 +1059,11 @@ func (h *Home) getVisibleHeight() int {
 		if listHeight < 5 {
 			listHeight = 5
 		}
-		panelContentHeight = listHeight - panelTitleLines
+		panelContentHeight = listHeight - panelTitleLines - projectBarHeight
 	case LayoutModeSingle:
-		panelContentHeight = contentHeight - panelTitleLines
+		panelContentHeight = contentHeight - panelTitleLines - projectBarHeight
 	default: // LayoutModeDual
-		panelContentHeight = contentHeight - panelTitleLines
+		panelContentHeight = contentHeight - panelTitleLines - projectBarHeight
 	}
 
 	maxVisible := panelContentHeight - 1
@@ -1901,6 +1959,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			h.instancesMu.Unlock()
+			h.ensureOrchestrators()
 			// Invalidate status counts cache
 			h.cachedStatusCounts.valid.Store(false)
 			// Sync group tree with loaded data
@@ -1976,6 +2035,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Run dedup to ensure the new session doesn't have a duplicate ID
 			session.UpdateClaudeSessionsWithDedup(h.instances)
 			h.instancesMu.Unlock()
+			h.ensureOrchestratorForProject(projectKeyForInstance(msg.instance))
 			// Invalidate status counts cache
 			h.cachedStatusCounts.valid.Store(false)
 
@@ -2031,6 +2091,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// This is critical: fork detection may have picked up wrong session
 			session.UpdateClaudeSessionsWithDedup(h.instances)
 			h.instancesMu.Unlock()
+			h.ensureOrchestratorForProject(projectKeyForInstance(msg.instance))
 			// Invalidate status counts cache
 			h.cachedStatusCounts.valid.Store(false)
 
@@ -2523,10 +2584,63 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case popupOpenedMsg:
+		if msg.err != nil {
+			h.setError(msg.err)
+		}
+		return h, nil
+
 	case tickMsg:
 		// Auto-dismiss errors after 5 seconds
 		if h.err != nil && !h.errTime.IsZero() && time.Since(h.errTime) > 5*time.Second {
 			h.clearError()
+		}
+
+		if len(h.projectList) > 0 {
+			h.refreshVerificationCache(h.projectList[h.projectIndex].Key)
+		}
+
+		var nudgeCmd tea.Cmd
+		var previewCmd tea.Cmd
+		now := time.Now()
+		if len(h.projectList) > 0 {
+			previewCmd = h.ensureOrchestratorPreview(h.projectList[h.projectIndex].Key)
+			for _, project := range h.projectList {
+				lastNudge := h.lastNudgeAtProject[project.Key]
+				if !lastNudge.IsZero() && now.Sub(lastNudge) < nudgeInterval {
+					continue
+				}
+				manager := h.ensureOrchestratorForProject(project.Key)
+				if manager == nil {
+					continue
+				}
+				var waitingAgents []*session.Instance
+				h.instancesMu.RLock()
+				for _, inst := range h.instances {
+					if projectKeyForInstance(inst) != project.Key {
+						continue
+					}
+					if isManagerSession(inst) {
+						continue
+					}
+					if !h.shouldNudgeSession(inst, now) {
+						continue
+					}
+					waitingAgents = append(waitingAgents, inst)
+				}
+				h.instancesMu.RUnlock()
+
+				if len(waitingAgents) == 0 {
+					continue
+				}
+
+				for _, inst := range waitingAgents {
+					h.lastNudgeAtSession[inst.ID] = now
+				}
+				h.lastNudgeAtProject[project.Key] = now
+				nudgeCmd = h.sendNudgeToManager(manager, waitingAgents)
+				break
+			}
 		}
 
 		// PERFORMANCE: Detect when navigation has settled (300ms since last up/down)
@@ -2609,7 +2723,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			h.previewCacheMu.Unlock()
 		}
-		return h, tea.Batch(h.tick(), previewCmd)
+		return h, tea.Batch(h.tick(), previewCmd, nudgeCmd)
 
 	case tea.KeyMsg:
 		// Track user activity for adaptive status updates
@@ -2978,6 +3092,16 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return h, h.fetchPreviewDebounced(selected.ID)
 			}
 		}
+
+		if nudgeCmd != nil && previewCmd != nil {
+			return h, tea.Batch(nudgeCmd, previewCmd)
+		}
+		if previewCmd != nil {
+			return h, previewCmd
+		}
+		if nudgeCmd != nil {
+			return h, nudgeCmd
+		}
 		return h, nil
 
 	case "down", "j":
@@ -3092,6 +3216,9 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					return h, nil
 				}
 				if item.Session.Exists() {
+					if h.attachMode() == "popup" {
+						return h, h.openPopupSession(item.Session)
+					}
 					h.isAttaching.Store(true) // Prevent View() output during transition (atomic)
 					return h, h.attachSession(item.Session)
 				}
@@ -3110,7 +3237,23 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-	case "tab", "l", "right":
+	case "right":
+		if h.switchProject(1) {
+			if selected := h.getSelectedSession(); selected != nil {
+				return h, h.fetchPreviewDebounced(selected.ID)
+			}
+		}
+		return h, nil
+
+	case "left":
+		if h.switchProject(-1) {
+			if selected := h.getSelectedSession(); selected != nil {
+				return h, h.fetchPreviewDebounced(selected.ID)
+			}
+		}
+		return h, nil
+
+	case "tab", "l":
 		// Expand/collapse group or expand if on session
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
@@ -3128,7 +3271,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-	case "h", "left":
+	case "h":
 		// Collapse group
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
@@ -3413,8 +3556,8 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "v":
-		// Toggle preview mode (cycle: both → output-only → analytics-only → both)
-		h.previewMode = (h.previewMode + 1) % 3
+		// Toggle preview mode (cycle: manager → both → output → analytics → manager)
+		h.previewMode = (h.previewMode + 1) % 4
 		return h, nil
 
 	case "y":
@@ -3472,17 +3615,53 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "x":
-		// Send session output to another session
+		// Send session output to manager session for this project
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession && item.Session != nil {
-				others := h.getOtherActiveSessions(item.Session.ID)
-				if len(others) == 0 {
-					h.setError(fmt.Errorf("no other sessions to send to"))
+				if isManagerSession(item.Session) {
+					h.setError(fmt.Errorf("selected session is orchestrator"))
 					return h, nil
 				}
-				h.sessionPickerDialog.SetSize(h.width, h.height)
-				h.sessionPickerDialog.Show(item.Session, h.instances)
+				projectKey := projectKeyForInstance(item.Session)
+				orchestrator := h.ensureOrchestratorForProject(projectKey)
+				if orchestrator == nil {
+					h.setError(fmt.Errorf("no orchestrator session for this project"))
+					return h, nil
+				}
+				return h, h.sendOutputToSession(item.Session, orchestrator)
+			}
+		}
+		return h, nil
+
+	case "A":
+		// Send orchestrator output to all waiting agents in this project
+		if h.cursor < len(h.flatItems) {
+			item := h.flatItems[h.cursor]
+			if item.Type == session.ItemTypeSession && item.Session != nil && isManagerSession(item.Session) {
+				orchestrator := item.Session
+				projectKey := projectKeyForInstance(orchestrator)
+				var targets []*session.Instance
+				h.instancesMu.RLock()
+				for _, inst := range h.instances {
+					if projectKeyForInstance(inst) != projectKey {
+						continue
+					}
+					if isManagerSession(inst) || inst.Status != session.StatusWaiting {
+						continue
+					}
+					targets = append(targets, inst)
+				}
+				h.instancesMu.RUnlock()
+				if len(targets) == 0 {
+					h.setError(fmt.Errorf("no waiting agents to reply to"))
+					return h, nil
+				}
+				cmds := make([]tea.Cmd, 0, len(targets))
+				for _, target := range targets {
+					cmds = append(cmds, h.sendOutputToSession(orchestrator, target))
+				}
+				return h, tea.Batch(cmds...)
 			}
 		}
 		return h, nil
@@ -3508,6 +3687,24 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			err := inst.Restart()
 			return sessionRestoredMsg{instance: inst, err: err}
 		}
+
+	case "ctrl+m":
+		// Jump to Orchestrator session for current project
+		projectKey := h.currentProjectKey()
+		orchestrator := h.ensureOrchestratorForProject(projectKey)
+		if orchestrator == nil {
+			h.setError(fmt.Errorf("no orchestrator session for this project"))
+			return h, nil
+		}
+		for i, item := range h.flatItems {
+			if item.Type == session.ItemTypeSession && item.Session != nil && item.Session.ID == orchestrator.ID {
+				h.cursor = i
+				h.syncViewport()
+				return h, nil
+			}
+		}
+		h.setError(fmt.Errorf("orchestrator session not visible in current filter"))
+		return h, nil
 
 	case "ctrl+r":
 		// Manual refresh (useful if watcher fails or for user preference)
@@ -4236,6 +4433,55 @@ skipSave:
 	})
 }
 
+func (h *Home) attachMode() string {
+	settings := session.GetInstanceSettings()
+	mode := strings.TrimSpace(strings.ToLower(settings.AttachMode))
+	if mode == "" {
+		if tmux.IsInsideTmux() {
+			return "popup"
+		}
+		return "replace"
+	}
+	if mode == "popup" && !tmux.IsInsideTmux() {
+		return "replace"
+	}
+	if mode != "popup" {
+		return "replace"
+	}
+	return mode
+}
+
+func (h *Home) openPopupSession(inst *session.Instance) tea.Cmd {
+	return func() tea.Msg {
+		if inst == nil {
+			return popupOpenedMsg{err: fmt.Errorf("session not found")}
+		}
+		tmuxSess := inst.GetTmuxSession()
+		if tmuxSess == nil {
+			return popupOpenedMsg{err: fmt.Errorf("tmux session not initialized")}
+		}
+		if !tmux.IsInsideTmux() {
+			return popupOpenedMsg{err: fmt.Errorf("popup attach requires running inside tmux")}
+		}
+
+		// Mark session as accessed and acknowledge if waiting.
+		inst.MarkAccessed()
+		if inst.Status == session.StatusWaiting {
+			tmuxSess.Acknowledge()
+		}
+
+		settings := session.GetInstanceSettings()
+		title := inst.Title
+		if strings.TrimSpace(title) == "" {
+			title = inst.Tool
+		}
+
+		err := tmux.DisplayPopup(title, settings.PopupWidth, settings.PopupHeight,
+			"tmux", "attach-session", "-t", tmuxSess.Name)
+		return popupOpenedMsg{err: err}
+	}
+}
+
 // attachCmd implements tea.ExecCommand for custom PTY attach
 type attachCmd struct {
 	session *tmux.Session
@@ -4535,12 +4781,12 @@ func (h *Home) View() string {
 		Foreground(ColorAccent)
 
 	// Show profile in title if not default
-	titleText := "Agent Deck"
+	titleText := "Claude Ninja"
 	if h.profile != "" && h.profile != session.DefaultProfile {
 		profileStyle := lipgloss.NewStyle().
 			Foreground(ColorCyan).
 			Bold(true)
-		titleText = "Agent Deck " + profileStyle.Render("["+h.profile+"]")
+		titleText = "Claude Ninja " + profileStyle.Render("["+h.profile+"]")
 	}
 	title := titleStyle.Render(titleText)
 
@@ -4613,7 +4859,7 @@ func (h *Home) View() string {
 			Bold(true).
 			Width(h.width).
 			Align(lipgloss.Center)
-		updateText := fmt.Sprintf(" ⬆ Update available: v%s → v%s (run: agent-deck update) ",
+		updateText := fmt.Sprintf(" ⬆ Update available: v%s → v%s (run: claude-ninja update) ",
 			h.updateInfo.CurrentVersion, h.updateInfo.LatestVersion)
 		b.WriteString(updateStyle.Render(updateText))
 		b.WriteString("\n")
@@ -4636,26 +4882,13 @@ func (h *Home) View() string {
 	}
 
 	// ═══════════════════════════════════════════════════════════════════
-	// MAIN CONTENT AREA - Responsive layout based on terminal width
+	// MAIN CONTENT AREA - Orchestrator-first dashboard
 	// ═══════════════════════════════════════════════════════════════════
 	helpBarHeight := 2 // Help bar takes 2 lines (border + content)
 	// Height breakdown: -1 header, -filterBarHeight filter, -updateBannerHeight banner, -maintenanceBannerHeight maintenance, -helpBarHeight help
 	contentHeight := h.height - 1 - helpBarHeight - updateBannerHeight - maintenanceBannerHeight - filterBarHeight
 
-	// Route to appropriate layout based on terminal width
-	layoutMode := h.getLayoutMode()
-
-	var mainContent string
-	switch layoutMode {
-	case LayoutModeSingle:
-		mainContent = h.renderSingleColumnLayout(contentHeight)
-	case LayoutModeStacked:
-		mainContent = h.renderStackedLayout(contentHeight)
-	default: // LayoutModeDual
-		mainContent = h.renderDualColumnLayout(contentHeight)
-	}
-
-	// Ensure mainContent has exact height
+	mainContent := h.renderOrchestratorLayout(contentHeight)
 	mainContent = ensureExactHeight(mainContent, contentHeight)
 	b.WriteString(mainContent)
 	b.WriteString("\n")
@@ -4730,6 +4963,372 @@ func (h *Home) renderPanelTitle(title string, width int) string {
 	return titleStyle.Render(title) + "\n" + underline
 }
 
+func (h *Home) renderOrchestratorLayout(contentHeight int) string {
+	if contentHeight <= 0 {
+		return ""
+	}
+
+	projectBar := h.renderProjectBar(h.width)
+	if projectBar == "" {
+		projectBar = lipgloss.NewStyle().Foreground(ColorTextDim).Render("No projects yet")
+	}
+
+	header := lipgloss.NewStyle().
+		Background(ColorSurface).
+		Padding(0, 1).
+		Width(h.width).
+		Render(projectBar)
+
+	bodyHeight := contentHeight - 1
+	if bodyHeight < 1 {
+		return header
+	}
+
+	if len(h.projectList) == 0 {
+		empty := renderEmptyStateResponsive(EmptyStateConfig{
+			Icon:     "✦",
+			Title:    "Create or open a project",
+			Subtitle: "Claude Ninja orchestrates agents around your repo",
+			Hints: []string{
+				"Press n to create a session in a new folder (new project)",
+				"Press i to import existing tmux sessions",
+				"Use /ninja:new-project from the Orchestrator to plan tasks",
+			},
+		}, h.width, bodyHeight)
+		return header + "\n" + empty
+	}
+
+	if h.width < 90 {
+		topHeight := max(6, int(float64(bodyHeight)*0.6))
+		bottomHeight := bodyHeight - topHeight - 1
+		if bottomHeight < 4 {
+			bottomHeight = 4
+			topHeight = max(4, bodyHeight-bottomHeight-1)
+		}
+		chat := h.renderOrchestratorChatPanel(h.width, topHeight)
+		divider := lipgloss.NewStyle().Foreground(ColorBorder).Render(strings.Repeat("─", max(0, h.width)))
+		side := h.renderOrchestratorSidePanel(h.width, bottomHeight)
+		return header + "\n" + chat + "\n" + divider + "\n" + side
+	}
+
+	leftWidth := int(float64(h.width) * 0.6)
+	if leftWidth < 40 {
+		leftWidth = 40
+	}
+	rightWidth := h.width - leftWidth - 1
+	if rightWidth < 30 {
+		rightWidth = 30
+		leftWidth = h.width - rightWidth - 1
+	}
+
+	chat := h.renderOrchestratorChatPanel(leftWidth, bodyHeight)
+	side := h.renderOrchestratorSidePanel(rightWidth, bodyHeight)
+	gap := lipgloss.NewStyle().Foreground(ColorBorder).Render("│")
+	row := lipgloss.JoinHorizontal(lipgloss.Top, chat, gap, side)
+	return header + "\n" + row
+}
+
+func (h *Home) renderOrchestratorChatPanel(width, height int) string {
+	if height <= 0 || width <= 0 {
+		return ""
+	}
+
+	projectKey := h.currentProjectKey()
+	orchestrator := h.ensureOrchestratorForProject(projectKey)
+
+	header := h.renderPanelTitle("Orchestrator Chat", width)
+	contentHeight := height - strings.Count(header, "\n") - 1
+	if contentHeight < 1 {
+		contentHeight = 1
+	}
+
+	if orchestrator == nil {
+		body := lipgloss.NewStyle().Foreground(ColorTextDim).Render("No orchestrator yet. Press n to create your first session.")
+		return ensureExactHeight(header+"\n"+body, height)
+	}
+
+	statusIcon := statusIconFor(orchestrator.Status)
+	statusLine := fmt.Sprintf("%s %s  [%s]", statusIcon, orchestrator.Title, orchestrator.Tool)
+	statusStyle := lipgloss.NewStyle().Foreground(ColorText)
+
+	preview := h.getCachedPreview(orchestrator.ID)
+	var body string
+	if preview == "" {
+		body = lipgloss.NewStyle().Foreground(ColorTextDim).Italic(true).Render("Open the orchestrator to start chatting.")
+	} else {
+		body = h.renderPreviewContent(preview, width, contentHeight-2)
+	}
+
+	info := statusStyle.Render(statusLine)
+	combined := header + "\n" + info + "\n" + body
+	return ensureExactHeight(combined, height)
+}
+
+func (h *Home) renderOrchestratorSidePanel(width, height int) string {
+	if height <= 0 || width <= 0 {
+		return ""
+	}
+
+	project := h.projectList[h.projectIndex]
+	orchestrator := h.ensureOrchestratorForProject(project.Key)
+
+	var b strings.Builder
+	b.WriteString(h.renderPanelTitle("Project Overview", width))
+	b.WriteString("\n")
+
+	labelStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
+	valueStyle := lipgloss.NewStyle().Foreground(ColorText)
+
+	b.WriteString(labelStyle.Render("Project: "))
+	b.WriteString(valueStyle.Render(project.Name))
+	b.WriteString("\n")
+
+	b.WriteString(labelStyle.Render("Path:    "))
+	b.WriteString(valueStyle.Render(truncatePath(project.Path, width-12)))
+	b.WriteString("\n")
+
+	if orchestrator != nil {
+		b.WriteString(labelStyle.Render(orchestratorTitle + ": "))
+		b.WriteString(valueStyle.Render(orchestrator.Title))
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
+
+	b.WriteString(renderSectionDivider("Agents", width-2))
+	b.WriteString("\n")
+	b.WriteString(h.renderAgentList(width, 6))
+	b.WriteString("\n")
+
+	b.WriteString(renderSectionDivider("Tasks", width-2))
+	b.WriteString("\n")
+	b.WriteString(h.renderTaskList(project.Key, width, 6))
+	b.WriteString("\n")
+
+	b.WriteString(renderSectionDivider("Waiting Inbox", width-2))
+	b.WriteString("\n")
+	b.WriteString(h.renderWaitingList(project.Key, width, 6))
+
+	return ensureExactHeight(b.String(), height)
+}
+
+func (h *Home) renderAgentList(width, maxCount int) string {
+	h.instancesMu.RLock()
+	defer h.instancesMu.RUnlock()
+
+	projectKey := h.currentProjectKey()
+	var agents []*session.Instance
+	for _, inst := range h.instances {
+		if projectKeyForInstance(inst) != projectKey {
+			continue
+		}
+		agents = append(agents, inst)
+	}
+
+	if len(agents) == 0 {
+		return lipgloss.NewStyle().Foreground(ColorTextDim).Italic(true).Render("No agents yet.")
+	}
+
+	sort.Slice(agents, func(i, j int) bool {
+		if agents[i].IsManager && !agents[j].IsManager {
+			return true
+		}
+		if !agents[i].IsManager && agents[j].IsManager {
+			return false
+		}
+		return agents[i].GetLastActivityTime().After(agents[j].GetLastActivityTime())
+	})
+
+	if maxCount > 0 && len(agents) > maxCount {
+		agents = agents[:maxCount]
+	}
+
+	var lines []string
+	for _, inst := range agents {
+		status := statusIconFor(inst.Status)
+		task := inst.GroupPath
+		if strings.TrimSpace(task) == "" {
+			task = "general"
+		}
+		label := inst.Title
+		if inst.IsManager {
+			label = orchestratorTitle + ": " + inst.Title
+		}
+		line := fmt.Sprintf("%s %s [%s] · %s", status, label, inst.Tool, task)
+		lines = append(lines, truncateLine(line, max(20, width-2)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (h *Home) renderTaskList(projectKey string, width, maxCount int) string {
+	tasks := h.getProjectTasks(projectKey, maxCount)
+	if len(tasks) == 0 {
+		return lipgloss.NewStyle().Foreground(ColorTextDim).Italic(true).Render("No tasks yet. Add to .planning/TASKS.md")
+	}
+
+	var lines []string
+	for _, task := range tasks {
+		box := "☐"
+		if task.Done {
+			box = "☑"
+		}
+		line := fmt.Sprintf("%s %s", box, task.Title)
+		lines = append(lines, truncateLine(line, max(20, width-2)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (h *Home) renderWaitingList(projectKey string, width, maxCount int) string {
+	h.instancesMu.RLock()
+	defer h.instancesMu.RUnlock()
+
+	var waiting []*session.Instance
+	for _, inst := range h.instances {
+		if projectKeyForInstance(inst) != projectKey {
+			continue
+		}
+		if inst.Status == session.StatusWaiting && !isManagerSession(inst) {
+			waiting = append(waiting, inst)
+		}
+	}
+	if len(waiting) == 0 {
+		return lipgloss.NewStyle().Foreground(ColorTextDim).Italic(true).Render("No waiting agents.")
+	}
+	if maxCount > 0 && len(waiting) > maxCount {
+		waiting = waiting[:maxCount]
+	}
+
+	var lines []string
+	for _, inst := range waiting {
+		summary := h.buildNudgeSummary(inst)
+		line := fmt.Sprintf("◐ %s — %s", inst.Title, summary)
+		lines = append(lines, truncateLine(line, max(20, width-2)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+type projectTask struct {
+	Title string
+	Done  bool
+}
+
+func (h *Home) getProjectTasks(projectKey string, maxCount int) []projectTask {
+	if projectKey == "" || projectKey == "~" {
+		return nil
+	}
+
+	paths := []string{
+		filepath.Join(projectKey, ".planning", "TASKS.md"),
+		filepath.Join(projectKey, ".planning", "ROADMAP.md"),
+	}
+
+	var tasks []projectTask
+	re := regexp.MustCompile(`^\s*-\s*\[([ xX])\]\s*(.+)$`)
+
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			m := re.FindStringSubmatch(line)
+			if len(m) < 3 {
+				continue
+			}
+			task := projectTask{
+				Title: strings.TrimSpace(m[2]),
+				Done:  strings.TrimSpace(m[1]) != "",
+			}
+			if task.Title != "" {
+				tasks = append(tasks, task)
+			}
+			if maxCount > 0 && len(tasks) >= maxCount {
+				return tasks
+			}
+		}
+		if len(tasks) > 0 {
+			break
+		}
+	}
+	return tasks
+}
+
+func statusIconFor(status session.Status) string {
+	switch status {
+	case session.StatusRunning:
+		return SessionStatusRunning.Render("●")
+	case session.StatusWaiting:
+		return SessionStatusWaiting.Render("◐")
+	case session.StatusError:
+		return SessionStatusError.Render("✕")
+	default:
+		return lipgloss.NewStyle().Foreground(ColorTextDim).Render("○")
+	}
+}
+
+func (h *Home) getCachedPreview(sessionID string) string {
+	h.previewCacheMu.RLock()
+	preview := h.previewCache[sessionID]
+	h.previewCacheMu.RUnlock()
+	return preview
+}
+
+func (h *Home) ensureOrchestratorPreview(projectKey string) tea.Cmd {
+	if projectKey == "" {
+		return nil
+	}
+	orchestrator := h.ensureOrchestratorForProject(projectKey)
+	if orchestrator == nil {
+		return nil
+	}
+	const previewCacheTTL = 2 * time.Second
+	h.previewCacheMu.RLock()
+	cachedTime, hasCached := h.previewCacheTime[orchestrator.ID]
+	h.previewCacheMu.RUnlock()
+	if !hasCached || time.Since(cachedTime) > previewCacheTTL {
+		return h.fetchPreview(orchestrator)
+	}
+	return nil
+}
+
+func (h *Home) renderPreviewContent(preview string, width, height int) string {
+	if height <= 0 {
+		return ""
+	}
+
+	lines := strings.Split(preview, "\n")
+	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if len(lines) == 0 {
+		return lipgloss.NewStyle().Foreground(ColorTextDim).Italic(true).Render("(no output yet)")
+	}
+
+	maxLines := height
+	truncated := len(lines) > maxLines
+	if truncated {
+		lines = lines[len(lines)-maxLines:]
+	}
+
+	var out []string
+	if truncated {
+		out = append(out, lipgloss.NewStyle().Foreground(ColorTextDim).Italic(true).Render("⋮ older messages above"))
+	}
+
+	maxWidth := width - 2
+	if maxWidth < 10 {
+		maxWidth = 10
+	}
+	for _, line := range lines {
+		clean := tmux.StripANSI(line)
+		if runewidth.StringWidth(clean) > maxWidth {
+			clean = runewidth.Truncate(clean, maxWidth-3, "...")
+		}
+		out = append(out, clean)
+	}
+	return strings.Join(out, "\n")
+}
+
 // renderLoadingSplash creates a simple centered loading splash screen
 // Shows the three status indicators (running/waiting/idle) cycling
 func renderLoadingSplash(width, height int, frame int) string {
@@ -4781,7 +5380,7 @@ func renderLoadingSplash(width, height int, frame int) string {
 		content.WriteString("\n")
 		content.WriteString("      " + running + "   " + waiting + "   " + idle + "      \n")
 		content.WriteString("\n")
-		content.WriteString(titleStyle.Render("Agent Deck") + "\n")
+		content.WriteString(titleStyle.Render("Claude Ninja") + "\n")
 		content.WriteString("\n")
 		content.WriteString(subtitleStyle.Render("Loading sessions..."))
 	} else if width >= 25 && height >= 6 {
@@ -4799,11 +5398,11 @@ func renderLoadingSplash(width, height int, frame int) string {
 		}
 		content.WriteString(indicators + "\n")
 		content.WriteString("\n")
-		content.WriteString(titleStyle.Render("Agent Deck") + "\n")
+		content.WriteString(titleStyle.Render("Claude Ninja") + "\n")
 		content.WriteString(subtitleStyle.Render("Loading..."))
 	} else {
 		// Minimal
-		content.WriteString(greenStyle.Render("●") + " " + titleStyle.Render("Agent Deck") + "\n")
+		content.WriteString(greenStyle.Render("●") + " " + titleStyle.Render("Claude Ninja") + "\n")
 		content.WriteString(subtitleStyle.Render("Loading..."))
 	}
 
@@ -4862,12 +5461,12 @@ func renderQuittingSplash(width, height int, frame int) string {
 		content.WriteString("\n")
 		content.WriteString("      " + running + "   " + waiting + "   " + idle + "      \n")
 		content.WriteString("\n")
-		content.WriteString(titleStyle.Render("Agent Deck") + "\n")
+		content.WriteString(titleStyle.Render("Claude Ninja") + "\n")
 		content.WriteString("\n")
 		content.WriteString(subtitleStyle.Render("Shutting down..."))
 	} else {
 		// Compact/Minimal
-		content.WriteString(titleStyle.Render("Agent Deck") + "\n")
+		content.WriteString(titleStyle.Render("Claude Ninja") + "\n")
 		content.WriteString(subtitleStyle.Render("Shutting down..."))
 	}
 
@@ -5322,7 +5921,7 @@ func (h *Home) renderHelpBarCompact() string {
 			}
 		} else {
 			contextHints = []string{
-				h.helpKeyShort("⏎", "Attach"),
+				h.helpKeyShort("⏎", "Open"),
 				h.helpKeyShort("n", "New"),
 				h.helpKeyShort("R", "Restart"),
 			}
@@ -5331,10 +5930,13 @@ func (h *Home) renderHelpBarCompact() string {
 			}
 			if item.Session != nil && (item.Session.Tool == "claude" || item.Session.Tool == "gemini") {
 				contextHints = append(contextHints, h.helpKeyShort("M", "MCP"))
-				contextHints = append(contextHints, h.helpKeyShort("v", h.previewModeShort()))
 			}
+			contextHints = append(contextHints, h.helpKeyShort("v", h.previewModeShort()))
 			contextHints = append(contextHints, h.helpKeyShort("c", "Copy"))
-			contextHints = append(contextHints, h.helpKeyShort("x", "Send"))
+			contextHints = append(contextHints, h.helpKeyShort("x", "Orch"))
+			if item.Session != nil && isManagerSession(item.Session) {
+				contextHints = append(contextHints, h.helpKeyShort("A", "All"))
+			}
 		}
 	}
 
@@ -5346,6 +5948,8 @@ func (h *Home) renderHelpBarCompact() string {
 	// Global hints (abbreviated)
 	globalStyle := lipgloss.NewStyle().Foreground(ColorComment)
 	globalHints := globalStyle.Render("↑↓ Nav") + " " +
+		globalStyle.Render("←/→") + " " +
+		globalStyle.Render("Ctrl+M Orch") + " " +
 		globalStyle.Render("/") + " " +
 		globalStyle.Render("?") + " " +
 		globalStyle.Render("q")
@@ -5375,6 +5979,8 @@ func (h *Home) helpKeyShort(key, desc string) string {
 // previewModeShort returns a short description of current preview mode for help bar
 func (h *Home) previewModeShort() string {
 	switch h.previewMode {
+	case PreviewModeManager:
+		return "Orch"
 	case PreviewModeOutput:
 		return "Out"
 	case PreviewModeAnalytics:
@@ -5418,7 +6024,7 @@ func (h *Home) renderHelpBarFull() string {
 		} else {
 			contextTitle = "Session"
 			primaryHints = []string{
-				h.helpKey("Enter", "Attach"),
+				h.helpKey("Enter", "Open"),
 				h.helpKey("n", "New"),
 				h.helpKey("g", "Group"),
 				h.helpKey("R", "Restart"),
@@ -5430,10 +6036,13 @@ func (h *Home) renderHelpBarFull() string {
 			// Show MCP Manager and preview mode toggle for Claude and Gemini sessions
 			if item.Session != nil && (item.Session.Tool == "claude" || item.Session.Tool == "gemini") {
 				primaryHints = append(primaryHints, h.helpKey("M", "MCP"))
-				primaryHints = append(primaryHints, h.helpKey("v", h.previewModeShort()))
 			}
+			primaryHints = append(primaryHints, h.helpKey("v", h.previewModeShort()))
 			primaryHints = append(primaryHints, h.helpKey("c", "Copy"))
-			primaryHints = append(primaryHints, h.helpKey("x", "Send"))
+			primaryHints = append(primaryHints, h.helpKey("x", "Send→Orch"))
+			if item.Session != nil && isManagerSession(item.Session) {
+				primaryHints = append(primaryHints, h.helpKey("A", "ReplyAll"))
+			}
 			secondaryHints = []string{
 				h.helpKey("r", "Rename"),
 				h.helpKey("m", "Move"),
@@ -5476,6 +6085,8 @@ func (h *Home) renderHelpBarFull() string {
 	// Global shortcuts (right side) - more compact with separators
 	globalStyle := lipgloss.NewStyle().Foreground(ColorComment)
 	globalHints := globalStyle.Render("↑↓ Nav") + sep +
+		globalStyle.Render("\u2190/\u2192 Project") + sep +
+		globalStyle.Render("Ctrl+M Orch") + sep +
 		globalStyle.Render("/ Search  G Global") + sep +
 		globalStyle.Render("? Help  q Quit")
 
@@ -5506,9 +6117,406 @@ func (h *Home) helpKey(key, desc string) string {
 	return keyStyle.Render(key) + " " + descStyle.Render(desc)
 }
 
+func projectKeyForInstance(inst *session.Instance) string {
+	if inst == nil {
+		return ""
+	}
+	projectPath := inst.ProjectPath
+	if inst.WorktreeRepoRoot != "" {
+		projectPath = inst.WorktreeRepoRoot
+	}
+	projectPath = strings.TrimSpace(projectPath)
+	if projectPath == "" {
+		return "~"
+	}
+	return filepath.Clean(projectPath)
+}
+
+func projectNameForKey(key string) string {
+	if key == "" {
+		return "Unknown"
+	}
+	if key == "~" {
+		return "~"
+	}
+	base := filepath.Base(key)
+	if base == "." || base == string(filepath.Separator) || base == "" {
+		return key
+	}
+	return base
+}
+
+func (h *Home) refreshProjectList() {
+	h.instancesMu.RLock()
+	defer h.instancesMu.RUnlock()
+
+	projectMap := make(map[string]*projectInfo)
+	for _, inst := range h.instances {
+		key := projectKeyForInstance(inst)
+		info, exists := projectMap[key]
+		if !exists {
+			info = &projectInfo{
+				Key:  key,
+				Path: key,
+				Name: projectNameForKey(key),
+			}
+			projectMap[key] = info
+		}
+		info.SessionCount++
+		switch inst.Status {
+		case session.StatusWaiting:
+			info.WaitingCount++
+		case session.StatusRunning:
+			info.RunningCount++
+		}
+		activity := inst.GetLastActivityTime()
+		if activity.After(info.LastActivity) {
+			info.LastActivity = activity
+		}
+	}
+
+	list := make([]projectInfo, 0, len(projectMap))
+	for _, info := range projectMap {
+		list = append(list, *info)
+	}
+	sort.Slice(list, func(i, j int) bool {
+		nameI := strings.ToLower(list[i].Name)
+		nameJ := strings.ToLower(list[j].Name)
+		if nameI == nameJ {
+			return strings.ToLower(list[i].Path) < strings.ToLower(list[j].Path)
+		}
+		return nameI < nameJ
+	})
+	h.projectList = list
+	if h.projectIndex >= len(h.projectList) {
+		h.projectIndex = 0
+	}
+}
+
+func (h *Home) currentProjectKey() string {
+	if len(h.projectList) == 0 {
+		return ""
+	}
+	if h.projectIndex < 0 || h.projectIndex >= len(h.projectList) {
+		h.projectIndex = 0
+	}
+	return h.projectList[h.projectIndex].Key
+}
+
+func (h *Home) switchProject(delta int) bool {
+	if len(h.projectList) < 2 {
+		return false
+	}
+	next := h.projectIndex + delta
+	if next < 0 {
+		next = len(h.projectList) - 1
+	} else if next >= len(h.projectList) {
+		next = 0
+	}
+	if next == h.projectIndex {
+		return false
+	}
+	h.projectIndex = next
+	h.cursor = 0
+	h.viewOffset = 0
+	h.ensureOrchestratorForProject(h.projectList[h.projectIndex].Key)
+	h.rebuildFlatItems()
+	return true
+}
+
+func (h *Home) renderProjectBar(width int) string {
+	if len(h.projectList) == 0 {
+		return ""
+	}
+	current := h.projectList[h.projectIndex]
+	label := fmt.Sprintf("Project %d/%d: %s", h.projectIndex+1, len(h.projectList), current.Name)
+	counts := fmt.Sprintf("(%d)", current.SessionCount)
+	status := ""
+	if current.RunningCount > 0 {
+		status += " " + SessionStatusRunning.Render(fmt.Sprintf("● %d", current.RunningCount))
+	}
+	if current.WaitingCount > 0 {
+		status += " " + SessionStatusWaiting.Render(fmt.Sprintf("◐ %d", current.WaitingCount))
+	}
+	bar := label + " " + DimStyle.Render(counts) + status
+	if width > 0 {
+		bar = runewidth.Truncate(bar, max(0, width-2), "…")
+	}
+	barStyle := lipgloss.NewStyle().
+		Foreground(ColorText).
+		Background(ColorSurface).
+		Padding(0, 1)
+	return barStyle.Render(bar)
+}
+
+func isManagerSession(inst *session.Instance) bool {
+	if inst == nil {
+		return false
+	}
+	if inst.IsManager {
+		return true
+	}
+	title := strings.ToLower(inst.Title)
+	if strings.Contains(title, "manager") {
+		return true
+	}
+	group := strings.ToLower(inst.GroupPath)
+	return strings.Contains(group, "manager")
+}
+
+func (h *Home) getManagerForProject(projectKey string) *session.Instance {
+	h.instancesMu.RLock()
+	defer h.instancesMu.RUnlock()
+
+	var best *session.Instance
+	for _, inst := range h.instances {
+		if !inst.IsManager {
+			continue
+		}
+		if projectKeyForInstance(inst) != projectKey {
+			continue
+		}
+		if best == nil {
+			best = inst
+			continue
+		}
+		if inst.LastAccessedAt.After(best.LastAccessedAt) {
+			best = inst
+		}
+	}
+	return best
+}
+
+func (h *Home) ensureOrchestratorForProject(projectKey string) *session.Instance {
+	if projectKey == "" {
+		return nil
+	}
+	h.instancesMu.Lock()
+	defer h.instancesMu.Unlock()
+
+	var existing *session.Instance
+	for _, inst := range h.instances {
+		if projectKeyForInstance(inst) != projectKey {
+			continue
+		}
+		if inst.IsManager {
+			existing = inst
+			break
+		}
+	}
+	if existing != nil {
+		return existing
+	}
+
+	// Prefer Claude sessions as orchestrator; fallback to most recently active.
+	var best *session.Instance
+	for _, inst := range h.instances {
+		if projectKeyForInstance(inst) != projectKey {
+			continue
+		}
+		if inst.Status == session.StatusError {
+			continue
+		}
+		if best == nil {
+			best = inst
+			continue
+		}
+		if inst.Tool == "claude" && best.Tool != "claude" {
+			best = inst
+			continue
+		}
+		if inst.GetLastActivityTime().After(best.GetLastActivityTime()) {
+			best = inst
+		}
+	}
+	if best != nil {
+		best.IsManager = true
+	}
+	return best
+}
+
+func (h *Home) ensureOrchestrators() {
+	projectKeys := make(map[string]bool)
+	h.instancesMu.RLock()
+	for _, inst := range h.instances {
+		projectKeys[projectKeyForInstance(inst)] = true
+	}
+	h.instancesMu.RUnlock()
+
+	for key := range projectKeys {
+		h.ensureOrchestratorForProject(key)
+	}
+}
+
+func (h *Home) shouldNudgeSession(inst *session.Instance, now time.Time) bool {
+	if inst == nil {
+		return false
+	}
+	if inst.Status != session.StatusWaiting {
+		return false
+	}
+	waitingSince := inst.GetWaitingSince()
+	if waitingSince.IsZero() {
+		waitingSince = inst.CreatedAt
+	}
+	if now.Sub(waitingSince) < nudgeThreshold {
+		return false
+	}
+	if last, ok := h.lastNudgeAtSession[inst.ID]; ok {
+		if now.Sub(last) < nudgeInterval {
+			return false
+		}
+	}
+	return true
+}
+
+func (h *Home) sendNudgeToManager(manager *session.Instance, waiting []*session.Instance) tea.Cmd {
+	return func() tea.Msg {
+		if manager == nil || len(waiting) == 0 {
+			return nil
+		}
+		tmuxSession := manager.GetTmuxSession()
+		if tmuxSession == nil {
+			return nil
+		}
+
+		var lines []string
+		lines = append(lines, "[Orchestrator Nudge] Waiting agents need input:")
+		for _, inst := range waiting {
+			waitingFor := formatRelativeTime(inst.GetWaitingSince())
+			summary := h.buildNudgeSummary(inst)
+			if summary != "" {
+				lines = append(lines, fmt.Sprintf("- %s (waiting %s) :: %s", inst.Title, waitingFor, summary))
+			} else {
+				lines = append(lines, fmt.Sprintf("- %s (waiting %s)", inst.Title, waitingFor))
+			}
+		}
+		lines = append(lines, "Reply here and I will route your answer.")
+		message := strings.Join(lines, "\n") + "\n"
+
+		if err := tmuxSession.SendKeysChunked(message); err != nil {
+			return sendOutputResultMsg{
+				targetTitle: manager.Title,
+				err:         fmt.Errorf("nudge failed: %w", err),
+			}
+		}
+		return nil
+	}
+}
+
+func (h *Home) buildNudgeSummary(inst *session.Instance) string {
+	if inst == nil {
+		return ""
+	}
+	if inst.LatestPrompt != "" {
+		return "Prompt: " + truncateLine(inst.LatestPrompt, 180)
+	}
+	resp, err := inst.GetLastResponse()
+	if err == nil && resp.Content != "" {
+		return "Last response: " + truncateLine(resp.Content, 180)
+	}
+	return ""
+}
+
+func (h *Home) getProjectVerification(projectKey string) string {
+	if projectKey == "" {
+		return ""
+	}
+	if cached, ok := h.verificationCache[projectKey]; ok {
+		return cached
+	}
+	return ""
+}
+
+func (h *Home) refreshVerificationCache(projectKey string) {
+	if projectKey == "" {
+		return
+	}
+	now := time.Now()
+	if t, ok := h.verificationCacheTime[projectKey]; ok && now.Sub(t) < 5*time.Second {
+		return
+	}
+
+	verificationPath := filepath.Join(projectKey, ".planning", "VERIFICATION.md")
+	data, err := os.ReadFile(verificationPath)
+	if err != nil {
+		h.verificationCache[projectKey] = ""
+		h.verificationCacheTime[projectKey] = now
+		return
+	}
+
+	content := strings.TrimSpace(string(data))
+	if content == "" {
+		h.verificationCache[projectKey] = ""
+		h.verificationCacheTime[projectKey] = now
+		return
+	}
+	if len(content) > 2000 {
+		content = content[:2000] + "\n…"
+	}
+
+	h.verificationCache[projectKey] = content
+	h.verificationCacheTime[projectKey] = now
+}
+
+func (h *Home) getPhaseSummary(projectKey string) string {
+	if projectKey == "" {
+		return ""
+	}
+	roadmapPath := filepath.Join(projectKey, ".planning", "ROADMAP.md")
+	statePath := filepath.Join(projectKey, ".planning", "STATE.md")
+
+	total := 0
+	if data, err := os.ReadFile(roadmapPath); err == nil {
+		re := regexp.MustCompile(`(?im)^#+\s*phase\s+([0-9]+)`)
+		matches := re.FindAllStringSubmatch(string(data), -1)
+		if len(matches) > 0 {
+			seen := make(map[string]bool)
+			for _, m := range matches {
+				if len(m) < 2 {
+					continue
+				}
+				if !seen[m[1]] {
+					seen[m[1]] = true
+					total++
+				}
+			}
+		}
+	}
+
+	current := ""
+	if data, err := os.ReadFile(statePath); err == nil {
+		re := regexp.MustCompile(`(?im)phase[^0-9]*([0-9]+)`)
+		if m := re.FindStringSubmatch(string(data)); len(m) > 1 {
+			current = m[1]
+		}
+	}
+
+	if current != "" && total > 0 {
+		return fmt.Sprintf("Step %s of %d", current, total)
+	}
+	if current != "" {
+		return fmt.Sprintf("Step %s", current)
+	}
+	if total > 0 {
+		return fmt.Sprintf("%d phases planned", total)
+	}
+	return ""
+}
+
 // renderSessionList renders the left panel with hierarchical session list
 func (h *Home) renderSessionList(width, height int) string {
 	var b strings.Builder
+
+	projectBar := h.renderProjectBar(width)
+	if projectBar != "" {
+		b.WriteString(projectBar)
+		b.WriteString("\n")
+		height--
+		if height < 1 {
+			return b.String()
+		}
+	}
 
 	if len(h.flatItems) == 0 {
 		// Responsive empty state - adapts to available space
@@ -5522,15 +6530,20 @@ func (h *Home) renderSessionList(width, height int) string {
 			contentHeight = 5
 		}
 
+		hints := []string{
+			"Press n to create a new session",
+			"Press i to import existing tmux sessions",
+			"Press g to create a group",
+		}
+		if len(h.projectList) > 1 {
+			hints = append(hints, "Use \u2190/\u2192 to switch projects")
+		}
+
 		emptyContent := renderEmptyStateResponsive(EmptyStateConfig{
 			Icon:     "⬡",
 			Title:    "No Sessions Yet",
 			Subtitle: "Get started by creating your first session",
-			Hints: []string{
-				"Press n to create a new session",
-				"Press i to import existing tmux sessions",
-				"Press g to create a group",
-			},
+			Hints:    hints,
 		}, contentWidth, contentHeight)
 
 		return lipgloss.NewStyle().
@@ -5778,10 +6791,19 @@ func (h *Home) renderSessionItem(b *strings.Builder, item session.Item, selected
 		yoloBadge = yoloStyle.Render(" [YOLO]")
 	}
 
+	managerBadge := ""
+	if isManagerSession(inst) {
+		badgeStyle := TagStyle
+		if selected {
+			badgeStyle = TagActiveStyle
+		}
+		managerBadge = badgeStyle.Render(" MANAGER")
+	}
+
 	// Build row: [baseIndent][selection][tree][status] [title] [tool] [yolo]
 	// Format: " ├─ ● session-name tool" or "▶└─ ● session-name tool"
 	// Sub-sessions get extra indent: "   ├─◐ sub-session tool"
-	row := fmt.Sprintf("%s%s%s %s %s%s%s", baseIndent, selectionPrefix, treeStyle.Render(treeConnector), status, title, tool, yoloBadge)
+	row := fmt.Sprintf("%s%s%s %s %s%s%s%s", baseIndent, selectionPrefix, treeStyle.Render(treeConnector), status, title, tool, managerBadge, yoloBadge)
 	b.WriteString(row)
 	b.WriteString("\n")
 }
@@ -6067,9 +7089,144 @@ func (h *Home) renderSessionInfoCard(inst *session.Instance, width, height int) 
 	return b.String()
 }
 
+func (h *Home) renderManagerPanel(width, height int) string {
+	var b strings.Builder
+
+	if len(h.projectList) == 0 {
+		return renderEmptyStateResponsive(EmptyStateConfig{
+			Icon:     "✦",
+			Title:    orchestratorTitle + " Panel",
+			Subtitle: "Create or import a session to begin",
+			Hints: []string{
+				"Press n to create a new session",
+				"Press i to import tmux sessions",
+			},
+		}, width, height)
+	}
+
+	project := h.projectList[h.projectIndex]
+	orchestrator := h.ensureOrchestratorForProject(project.Key)
+
+	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(ColorAccent)
+	b.WriteString(headerStyle.Render(orchestratorTitle + " Panel"))
+	b.WriteString("\n")
+	b.WriteString(strings.Repeat("─", max(0, min(width-4, 40))))
+	b.WriteString("\n\n")
+
+	labelStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
+	valueStyle := lipgloss.NewStyle().Foreground(ColorText)
+
+	b.WriteString(labelStyle.Render("Project: "))
+	b.WriteString(valueStyle.Render(project.Name))
+	b.WriteString("\n")
+
+	b.WriteString(labelStyle.Render("Path:    "))
+	b.WriteString(valueStyle.Render(truncatePath(project.Path, width-12)))
+	b.WriteString("\n")
+
+	statusLine := fmt.Sprintf("Sessions: %d", project.SessionCount)
+	if project.RunningCount > 0 {
+		statusLine += fmt.Sprintf("  %s", SessionStatusRunning.Render("● "+fmt.Sprint(project.RunningCount)))
+	}
+	if project.WaitingCount > 0 {
+		statusLine += fmt.Sprintf("  %s", SessionStatusWaiting.Render("◐ "+fmt.Sprint(project.WaitingCount)))
+	}
+	b.WriteString(labelStyle.Render("Status:  "))
+	b.WriteString(valueStyle.Render(statusLine))
+	b.WriteString("\n\n")
+
+	if phaseSummary := h.getPhaseSummary(project.Key); phaseSummary != "" {
+		b.WriteString(labelStyle.Render("Progress: "))
+		b.WriteString(valueStyle.Render(phaseSummary))
+		b.WriteString("\n\n")
+		b.WriteString(labelStyle.Render("Note:    "))
+		b.WriteString(valueStyle.Render("Steps are just checkpoints; use the number shown above."))
+		b.WriteString("\n\n")
+	}
+
+	if orchestrator != nil {
+		b.WriteString(labelStyle.Render(orchestratorTitle + ": "))
+		b.WriteString(valueStyle.Render(orchestrator.Title))
+		b.WriteString("\n\n")
+	}
+
+	h.instancesMu.RLock()
+	waiting := make([]*session.Instance, 0, 6)
+	for _, inst := range h.instances {
+		if projectKeyForInstance(inst) != project.Key {
+			continue
+		}
+		if inst.Status == session.StatusWaiting && !isManagerSession(inst) {
+			waiting = append(waiting, inst)
+			if len(waiting) >= 6 {
+				break
+			}
+		}
+	}
+	h.instancesMu.RUnlock()
+
+	section := renderSectionDivider("Waiting Agents (Inbox)", width-4)
+	b.WriteString(section)
+	b.WriteString("\n")
+	if len(waiting) == 0 {
+		b.WriteString(lipgloss.NewStyle().Foreground(ColorTextDim).Italic(true).Render("No waiting agents"))
+		b.WriteString("\n")
+	} else {
+		for _, inst := range waiting {
+			summary := h.buildNudgeSummary(inst)
+			if summary != "" {
+				line := fmt.Sprintf("• %s — %s", inst.Title, summary)
+				b.WriteString(valueStyle.Render(truncateLine(line, max(20, width-6))))
+			} else {
+				line := fmt.Sprintf("• %s", inst.Title)
+				b.WriteString(valueStyle.Render(line))
+			}
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString("\n")
+
+	verificationSection := renderSectionDivider("Verification", width-4)
+	b.WriteString(verificationSection)
+	b.WriteString("\n")
+	verification := h.getProjectVerification(project.Key)
+	if verification == "" {
+		b.WriteString(lipgloss.NewStyle().Foreground(ColorTextDim).Italic(true).Render("No verification report yet"))
+		b.WriteString("\n")
+	} else {
+		lines := strings.Split(verification, "\n")
+		maxLines := max(3, min(10, height/4))
+		for i := 0; i < len(lines) && i < maxLines; i++ {
+			b.WriteString(valueStyle.Render(truncateLine(lines[i], max(20, width-6))))
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString("\n")
+
+	flow := renderSectionDivider("Workflow", width-4)
+	b.WriteString(flow)
+	b.WriteString("\n")
+	b.WriteString(valueStyle.Render("Plan → Build → Verify"))
+	b.WriteString("\n")
+	b.WriteString(valueStyle.Render("/ninja:new-project → capture goals"))
+	b.WriteString("\n")
+	b.WriteString(valueStyle.Render("/ninja:plan-phase 1 → generate plan"))
+	b.WriteString("\n")
+	b.WriteString(valueStyle.Render("/ninja:execute-phase 1 → run agents"))
+	b.WriteString("\n")
+	b.WriteString(valueStyle.Render("/ninja:verify-work 1 → verify outcomes"))
+	b.WriteString("\n")
+
+	return ensureExactHeight(b.String(), height)
+}
+
 // renderPreviewPane renders the right panel with live preview
 func (h *Home) renderPreviewPane(width, height int) string {
 	var b strings.Builder
+
+	if h.previewMode == PreviewModeManager {
+		return h.renderManagerPanel(width, height)
+	}
 
 	if len(h.flatItems) == 0 || h.cursor >= len(h.flatItems) {
 		// Show different message when there are no sessions vs just no selection
@@ -6455,7 +7612,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		b.WriteString("\n")
 		b.WriteString("  ")
 		b.WriteString(keyStyle.Render("Enter"))
-		b.WriteString(dimStyle.Render(" - attach (will auto-start)"))
+		b.WriteString(dimStyle.Render(" - open (will auto-start)"))
 		b.WriteString("\n")
 
 		// Pad output to exact height to prevent layout shifts
@@ -6802,6 +7959,18 @@ func truncatePath(path string, maxLen int) string {
 		return runewidth.Truncate(path, maxLen-3, "...")
 	}
 	return string(runes[:startLen]) + "..." + string(runes[len(runes)-endLen:])
+}
+
+func truncateLine(text string, maxWidth int) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+	singleLine := strings.ReplaceAll(text, "\n", " ")
+	singleLine = strings.TrimSpace(singleLine)
+	if singleLine == "" {
+		return ""
+	}
+	return runewidth.Truncate(singleLine, maxWidth, "…")
 }
 
 // formatRelativeTime formats a time as a human-readable relative string

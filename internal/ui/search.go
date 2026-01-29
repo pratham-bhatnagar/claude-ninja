@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/session"
 )
 
 var (
@@ -176,7 +176,7 @@ func (s *Search) View() string {
 	header := lipgloss.NewStyle().
 		Foreground(ColorAccent).
 		Bold(true).
-		Render("🔍 Local Search (Agent Deck sessions)")
+		Render("🔍 Local Search (Claude Ninja sessions)")
 
 	// Build search input box
 	searchBox := searchBoxStyle.Render(s.input.View())

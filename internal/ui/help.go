@@ -104,7 +104,7 @@ func (h *HelpOverlay) View() string {
 				{"h / Left", "Collapse / parent"},
 				{"l / Right", "Expand / toggle"},
 				{"1-9", "Jump to group"},
-				{"Enter", "Attach / toggle"},
+				{"Enter", "Open / toggle"},
 			},
 		},
 		{
@@ -220,7 +220,7 @@ func (h *HelpOverlay) View() string {
 	}
 	lines = append(lines, "")
 	lines = append(lines, separatorStyle.Render(strings.Repeat("─", separatorWidth)))
-	lines = append(lines, versionStyle.Render("Agent Deck v"+Version))
+	lines = append(lines, versionStyle.Render("Claude Ninja v"+Version))
 
 	totalLines := len(lines)
 
