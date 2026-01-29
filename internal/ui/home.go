@@ -149,8 +149,9 @@ type Home struct {
 	flatItems    []session.Item // Flattened view for cursor navigation
 
 	// Project UI
-	projectList  []projectInfo
-	projectIndex int
+	projectList       []projectInfo
+	projectIndex      int
+	pendingProjectKey string
 
 	// Components
 	search              *Search
@@ -167,6 +168,9 @@ type Home struct {
 	analyticsPanel      *AnalyticsPanel      // For displaying session analytics
 	geminiModelDialog   *GeminiModelDialog   // For selecting Gemini model
 	sessionPickerDialog *SessionPickerDialog // For sending output to another session
+	projectWizard       *ProjectWizard
+	orchestratorInput   *OrchestratorInputDialog
+	orchestratorQueue   []string
 
 	// Analytics cache (async fetching with TTL)
 	currentAnalytics       *session.SessionAnalytics                  // Current analytics for selected session (Claude)
@@ -485,6 +489,9 @@ func NewHomeWithProfileAndMode(profile string, isPrimary bool) *Home {
 		analyticsPanel:        NewAnalyticsPanel(),
 		geminiModelDialog:     NewGeminiModelDialog(),
 		sessionPickerDialog:   NewSessionPickerDialog(),
+		projectWizard:         NewProjectWizard(),
+		orchestratorInput:     NewOrchestratorInputDialog(),
+		orchestratorQueue:     []string{},
 		cursor:                0,
 		initialLoading:        true, // Show splash until sessions load
 		ctx:                   ctx,
@@ -1893,6 +1900,8 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.setupWizard.SetSize(msg.Width, msg.Height)
 		h.settingsPanel.SetSize(msg.Width, msg.Height)
 		h.geminiModelDialog.SetSize(msg.Width, msg.Height)
+		h.projectWizard.SetSize(msg.Width, msg.Height)
+		h.orchestratorInput.SetSize(msg.Width, msg.Height)
 		return h, nil
 
 	case loadSessionsMsg:
@@ -2051,6 +2060,15 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			h.groupTree.AddSession(msg.instance)
 			h.rebuildFlatItems()
 			h.search.SetItems(h.instances)
+			if h.pendingProjectKey != "" {
+				for i, project := range h.projectList {
+					if project.Key == h.pendingProjectKey {
+						h.projectIndex = i
+						break
+					}
+				}
+				h.pendingProjectKey = ""
+			}
 
 			// Auto-select the new session
 			for i, item := range h.flatItems {
@@ -2808,6 +2826,12 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if h.sessionPickerDialog.IsVisible() {
 			return h.handleSessionPickerDialogKey(msg)
 		}
+		if h.projectWizard.IsVisible() {
+			return h.handleProjectWizardKey(msg)
+		}
+		if h.orchestratorInput.IsVisible() {
+			return h.handleOrchestratorInputKey(msg)
+		}
 
 		// Main view keys
 		return h.handleMainKey(msg)
@@ -3064,6 +3088,17 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q", "ctrl+c":
 		return h.tryQuit()
 
+	case "p":
+		h.projectWizard.Show()
+		return h, nil
+
+	case "o":
+		h.orchestratorInput.Show()
+		return h, nil
+
+	case "O":
+		return h, h.flushOrchestratorQueue()
+
 	case "esc":
 		// Dismiss maintenance banner if visible
 		if h.maintenanceMsg != "" {
@@ -3091,16 +3126,6 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if selected := h.getSelectedSession(); selected != nil {
 				return h, h.fetchPreviewDebounced(selected.ID)
 			}
-		}
-
-		if nudgeCmd != nil && previewCmd != nil {
-			return h, tea.Batch(nudgeCmd, previewCmd)
-		}
-		if previewCmd != nil {
-			return h, previewCmd
-		}
-		if nudgeCmd != nil {
-			return h, nudgeCmd
 		}
 		return h, nil
 
@@ -4763,6 +4788,12 @@ func (h *Home) View() string {
 	if h.sessionPickerDialog.IsVisible() {
 		return h.sessionPickerDialog.View()
 	}
+	if h.projectWizard.IsVisible() {
+		return h.projectWizard.View()
+	}
+	if h.orchestratorInput.IsVisible() {
+		return h.orchestratorInput.View()
+	}
 
 	// Reuse viewBuilder to reduce allocations (reset and pre-allocate)
 	h.viewBuilder.Reset()
@@ -4990,7 +5021,7 @@ func (h *Home) renderOrchestratorLayout(contentHeight int) string {
 			Title:    "Create or open a project",
 			Subtitle: "Claude Ninja orchestrates agents around your repo",
 			Hints: []string{
-				"Press n to create a session in a new folder (new project)",
+				"Press p to create or open a project",
 				"Press i to import existing tmux sessions",
 				"Use /ninja:new-project from the Orchestrator to plan tasks",
 			},
@@ -5050,16 +5081,35 @@ func (h *Home) renderOrchestratorChatPanel(width, height int) string {
 	statusIcon := statusIconFor(orchestrator.Status)
 	statusLine := fmt.Sprintf("%s %s  [%s]", statusIcon, orchestrator.Title, orchestrator.Tool)
 	statusStyle := lipgloss.NewStyle().Foreground(ColorText)
+	labelStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
 
 	preview := h.getCachedPreview(orchestrator.ID)
+	bodyHeight := contentHeight - 2
+	if bodyHeight < 1 {
+		bodyHeight = 1
+	}
+	if len(h.orchestratorQueue) > 0 {
+		bodyHeight--
+		if bodyHeight < 1 {
+			bodyHeight = 1
+		}
+	}
 	var body string
 	if preview == "" {
 		body = lipgloss.NewStyle().Foreground(ColorTextDim).Italic(true).Render("Open the orchestrator to start chatting.")
 	} else {
-		body = h.renderPreviewContent(preview, width, contentHeight-2)
+		body = h.renderPreviewContent(preview, width, bodyHeight)
 	}
 
 	info := statusStyle.Render(statusLine)
+	queueNote := ""
+	if len(h.orchestratorQueue) > 0 {
+		queueNote = labelStyle.Render("Queued messages: " + fmt.Sprint(len(h.orchestratorQueue)))
+	}
+	if queueNote != "" {
+		combined := header + "\n" + info + "\n" + queueNote + "\n" + body
+		return ensureExactHeight(combined, height)
+	}
 	combined := header + "\n" + info + "\n" + body
 	return ensureExactHeight(combined, height)
 }
@@ -5107,6 +5157,10 @@ func (h *Home) renderOrchestratorSidePanel(width, height int) string {
 	b.WriteString(renderSectionDivider("Waiting Inbox", width-2))
 	b.WriteString("\n")
 	b.WriteString(h.renderWaitingList(project.Key, width, 6))
+	b.WriteString("\n\n")
+	b.WriteString(renderSectionDivider("Queued Messages", width-2))
+	b.WriteString("\n")
+	b.WriteString(h.renderQueueList(width, 4))
 
 	return ensureExactHeight(b.String(), height)
 }
@@ -5251,6 +5305,163 @@ func (h *Home) getProjectTasks(projectKey string, maxCount int) []projectTask {
 		}
 	}
 	return tasks
+}
+
+func (h *Home) renderQueueList(width, maxCount int) string {
+	if len(h.orchestratorQueue) == 0 {
+		return lipgloss.NewStyle().Foreground(ColorTextDim).Italic(true).Render("No queued messages.")
+	}
+	count := len(h.orchestratorQueue)
+	if maxCount > 0 && count > maxCount {
+		count = maxCount
+	}
+	var lines []string
+	for i := 0; i < count; i++ {
+		line := fmt.Sprintf("• %s", h.orchestratorQueue[i])
+		lines = append(lines, truncateLine(line, max(20, width-2)))
+	}
+	if len(h.orchestratorQueue) > count {
+		lines = append(lines, lipgloss.NewStyle().Foreground(ColorTextDim).Render("… more queued"))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (h *Home) ensureProjectPath(mode int, path string) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("project path is required")
+	}
+	info, err := os.Stat(path)
+	if err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("path exists but is not a directory")
+		}
+		return nil
+	}
+	if !os.IsNotExist(err) {
+		return fmt.Errorf("failed to access path: %w", err)
+	}
+	if mode == ProjectModeOpen {
+		return fmt.Errorf("project path does not exist")
+	}
+	if mkErr := os.MkdirAll(path, 0755); mkErr != nil {
+		return fmt.Errorf("failed to create project directory: %w", mkErr)
+	}
+	return nil
+}
+
+func (h *Home) ensurePlanningFiles(projectPath, projectName string) error {
+	if projectPath == "" || projectPath == "~" {
+		return nil
+	}
+	planningDir := filepath.Join(projectPath, ".planning")
+	if err := os.MkdirAll(planningDir, 0755); err != nil {
+		return fmt.Errorf("failed to create .planning: %w", err)
+	}
+
+	writeIfMissing := func(name, content string) error {
+		path := filepath.Join(planningDir, name)
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		}
+		if !os.IsNotExist(err) {
+			return err
+		}
+		return os.WriteFile(path, []byte(content), 0644)
+	}
+
+	if projectName == "" {
+		projectName = filepath.Base(projectPath)
+	}
+
+	if err := writeIfMissing("TASKS.md", "# Tasks\n\n- [ ] Define scope for "+projectName+"\n- [ ] Set up project structure\n- [ ] Implement core functionality\n- [ ] Review and test changes\n"); err != nil {
+		return err
+	}
+	if err := writeIfMissing("ROADMAP.md", "# Roadmap\n\n## Step 1\n- [ ] Planning and scope\n\n## Step 2\n- [ ] Build core components\n\n## Step 3\n- [ ] Verify and refine\n"); err != nil {
+		return err
+	}
+	if err := writeIfMissing("STATE.md", "Step 1\n"); err != nil {
+		return err
+	}
+	if err := writeIfMissing("VERIFICATION.md", "Verification checklist:\n- [ ] Tests pass\n- [ ] Key flows validated\n"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (h *Home) createOrchestratorSession(projectPath, projectName string) tea.Cmd {
+	return func() tea.Msg {
+		if err := tmux.IsTmuxAvailable(); err != nil {
+			return sessionCreatedMsg{err: fmt.Errorf("cannot create session: %w", err)}
+		}
+
+		tool := session.GetDefaultTool()
+		command := tool
+		if tool == "" {
+			tool = "claude"
+			command = "claude"
+		}
+
+		switch command {
+		case "claude", "gemini", "opencode", "codex":
+			// use as-is
+		default:
+			if toolDef := session.GetToolDef(command); toolDef != nil {
+				tool = command
+				command = toolDef.Command
+			}
+		}
+
+		title := orchestratorTitle
+		if strings.TrimSpace(projectName) != "" {
+			title = orchestratorTitle + " · " + projectName
+		}
+
+		inst := session.NewInstanceWithGroupAndTool(title, projectPath, "orchestrator", tool)
+		inst.Command = command
+		inst.IsManager = true
+
+		if tool == "claude" {
+			if userConfig, err := session.LoadUserConfig(); err == nil && userConfig != nil {
+				panel := NewClaudeOptionsPanel()
+				panel.SetDefaults(userConfig)
+				if err := inst.SetClaudeOptions(panel.GetOptions()); err != nil {
+					return sessionCreatedMsg{err: err}
+				}
+			}
+		}
+
+		if err := inst.Start(); err != nil {
+			return sessionCreatedMsg{err: err}
+		}
+		return sessionCreatedMsg{instance: inst}
+	}
+}
+
+func (h *Home) sendMessageToOrchestrator(message string) tea.Cmd {
+	return func() tea.Msg {
+		projectKey := h.currentProjectKey()
+		orchestrator := h.ensureOrchestratorForProject(projectKey)
+		if orchestrator == nil {
+			return sendOutputResultMsg{err: fmt.Errorf("no orchestrator available")}
+		}
+		tmuxSession := orchestrator.GetTmuxSession()
+		if tmuxSession == nil {
+			return sendOutputResultMsg{targetTitle: orchestrator.Title, err: fmt.Errorf("orchestrator has no tmux pane")}
+		}
+		if err := tmuxSession.SendKeysChunked(message + "\n"); err != nil {
+			return sendOutputResultMsg{targetTitle: orchestrator.Title, err: fmt.Errorf("send failed: %w", err)}
+		}
+		return sendOutputResultMsg{sourceTitle: "You", targetTitle: orchestrator.Title, lineCount: strings.Count(message, "\n") + 1}
+	}
+}
+
+func (h *Home) flushOrchestratorQueue() tea.Cmd {
+	if len(h.orchestratorQueue) == 0 {
+		return nil
+	}
+	message := strings.Join(h.orchestratorQueue, "\n\n")
+	h.orchestratorQueue = nil
+	return h.sendMessageToOrchestrator(message)
 }
 
 func statusIconFor(status session.Status) string {
@@ -5949,6 +6160,9 @@ func (h *Home) renderHelpBarCompact() string {
 	globalStyle := lipgloss.NewStyle().Foreground(ColorComment)
 	globalHints := globalStyle.Render("↑↓ Nav") + " " +
 		globalStyle.Render("←/→") + " " +
+		globalStyle.Render("p Project") + " " +
+		globalStyle.Render("o Chat") + " " +
+		globalStyle.Render("O SendQ") + " " +
 		globalStyle.Render("Ctrl+M Orch") + " " +
 		globalStyle.Render("/") + " " +
 		globalStyle.Render("?") + " " +
@@ -6086,6 +6300,7 @@ func (h *Home) renderHelpBarFull() string {
 	globalStyle := lipgloss.NewStyle().Foreground(ColorComment)
 	globalHints := globalStyle.Render("↑↓ Nav") + sep +
 		globalStyle.Render("\u2190/\u2192 Project") + sep +
+		globalStyle.Render("p Project  o Chat  O SendQ") + sep +
 		globalStyle.Render("Ctrl+M Orch") + sep +
 		globalStyle.Render("/ Search  G Global") + sep +
 		globalStyle.Render("? Help  q Quit")
@@ -8212,6 +8427,60 @@ func (h *Home) handleSessionPickerDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd)
 	default:
 		h.sessionPickerDialog.Update(msg)
 		return h, nil
+	}
+}
+
+func (h *Home) handleProjectWizardKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		h.projectWizard.Hide()
+		return h, nil
+	case "enter":
+		mode, name, path := h.projectWizard.GetValues()
+		if strings.TrimSpace(path) == "" {
+			h.projectWizard.SetError("Project path is required.")
+			return h, nil
+		}
+		if err := h.ensureProjectPath(mode, path); err != nil {
+			h.projectWizard.SetError(err.Error())
+			return h, nil
+		}
+		if err := h.ensurePlanningFiles(path, name); err != nil {
+			h.projectWizard.SetError(err.Error())
+			return h, nil
+		}
+		h.pendingProjectKey = path
+		h.projectWizard.Hide()
+		return h, h.createOrchestratorSession(path, name)
+	default:
+		cmd := h.projectWizard.Update(msg)
+		return h, cmd
+	}
+}
+
+func (h *Home) handleOrchestratorInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		h.orchestratorInput.Hide()
+		return h, nil
+	case "ctrl+s":
+		message := h.orchestratorInput.Value()
+		if message == "" {
+			return h, nil
+		}
+		h.orchestratorQueue = append(h.orchestratorQueue, message)
+		h.orchestratorInput.Hide()
+		return h, nil
+	case "enter":
+		message := h.orchestratorInput.Value()
+		if message == "" {
+			return h, nil
+		}
+		h.orchestratorInput.Hide()
+		return h, h.sendMessageToOrchestrator(message)
+	default:
+		cmd := h.orchestratorInput.Update(msg)
+		return h, cmd
 	}
 }
 

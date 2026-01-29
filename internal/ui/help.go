@@ -110,6 +110,9 @@ func (h *HelpOverlay) View() string {
 		{
 			title: "SESSIONS",
 			items: [][2]string{
+				{"p", "Create/open project"},
+				{"o", "Message orchestrator"},
+				{"O", "Send queued messages"},
 				{"n", "New session"},
 				{"r", "Rename session"},
 				{"Shift+R", "Restart session"},
