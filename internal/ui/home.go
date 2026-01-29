@@ -2619,10 +2619,10 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		var nudgeCmd tea.Cmd
-		var previewCmd tea.Cmd
+		var orchestratorPreviewCmd tea.Cmd
 		now := time.Now()
 		if len(h.projectList) > 0 {
-			previewCmd = h.ensureOrchestratorPreview(h.projectList[h.projectIndex].Key)
+			orchestratorPreviewCmd = h.ensureOrchestratorPreview(h.projectList[h.projectIndex].Key)
 			for _, project := range h.projectList {
 				lastNudge := h.lastNudgeAtProject[project.Key]
 				if !lastNudge.IsZero() && now.Sub(lastNudge) < nudgeInterval {
@@ -2726,7 +2726,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Fetch preview for currently selected session (if stale/missing and not fetching)
 		// Cache expires after 2 seconds to show live terminal updates without excessive fetching
 		const previewCacheTTL = 2 * time.Second
-		var previewCmd tea.Cmd
+		var selectedPreviewCmd tea.Cmd
 		h.instancesMu.RLock()
 		selected := h.getSelectedSession()
 		h.instancesMu.RUnlock()
@@ -2737,11 +2737,12 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Only fetch if cache is stale/missing AND not currently fetching this session
 			if cacheExpired && h.previewFetchingID != selected.ID {
 				h.previewFetchingID = selected.ID
-				previewCmd = h.fetchPreview(selected)
+				selectedPreviewCmd = h.fetchPreview(selected)
 			}
 			h.previewCacheMu.Unlock()
 		}
-		return h, tea.Batch(h.tick(), previewCmd, nudgeCmd)
+		cmds := []tea.Cmd{h.tick(), nudgeCmd, orchestratorPreviewCmd, selectedPreviewCmd}
+		return h, tea.Batch(cmds...)
 
 	case tea.KeyMsg:
 		// Track user activity for adaptive status updates
@@ -5360,11 +5361,12 @@ func (h *Home) ensurePlanningFiles(projectPath, projectName string) error {
 
 	writeIfMissing := func(name, content string) error {
 		path := filepath.Join(planningDir, name)
-		if _, err := os.Stat(path); err == nil {
+		_, statErr := os.Stat(path)
+		if statErr == nil {
 			return nil
 		}
-		if !os.IsNotExist(err) {
-			return err
+		if !os.IsNotExist(statErr) {
+			return statErr
 		}
 		return os.WriteFile(path, []byte(content), 0644)
 	}
