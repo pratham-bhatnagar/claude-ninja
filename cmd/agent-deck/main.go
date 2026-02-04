@@ -16,10 +16,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/asheshgoplani/agent-deck/internal/git"
-	"github.com/asheshgoplani/agent-deck/internal/session"
-	"github.com/asheshgoplani/agent-deck/internal/ui"
-	"github.com/asheshgoplani/agent-deck/internal/update"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/git"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/session"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/ui"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/update"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
@@ -1958,7 +1958,7 @@ func handleUninstall(args []string) {
 
 	fmt.Println()
 	fmt.Println("Thank you for using Agent Deck!")
-	fmt.Println("Feedback: https://github.com/asheshgoplani/agent-deck/issues")
+	fmt.Println("Feedback: https://github.com/pratham-bhatnagar/claude-ninja/issues")
 }
 
 // formatSize formats bytes into human-readable size

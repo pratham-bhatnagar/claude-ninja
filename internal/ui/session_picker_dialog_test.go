@@ -6,7 +6,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/session"
 )
 
 func makeTestInstances() []*session.Instance {

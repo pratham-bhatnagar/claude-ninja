@@ -6,7 +6,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/session"
 )
 
 // handleGroup dispatches group subcommands

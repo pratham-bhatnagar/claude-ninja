@@ -5,8 +5,8 @@ import (
 	"log"
 	"sync"
 
-	"github.com/asheshgoplani/agent-deck/internal/mcppool"
-	"github.com/asheshgoplani/agent-deck/internal/platform"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/mcppool"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/platform"
 )
 
 // Global MCP pool instance

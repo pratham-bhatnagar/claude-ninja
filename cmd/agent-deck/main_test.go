@@ -4,7 +4,7 @@ import (
 	"os/exec"
 	"testing"
 
-	"github.com/asheshgoplani/agent-deck/internal/ui"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/ui"
 )
 
 func TestTmuxAvailable(t *testing.T) {

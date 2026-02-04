@@ -7,8 +7,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/asheshgoplani/agent-deck/internal/git"
-	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/git"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/session"
 )
 
 // handleWorktree dispatches worktree subcommands

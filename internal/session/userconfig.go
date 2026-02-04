@@ -10,7 +10,7 @@ import (
 	"sync"
 
 	"github.com/BurntSushi/toml"
-	"github.com/asheshgoplani/agent-deck/internal/platform"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/platform"
 )
 
 // UserConfigFileName is the TOML config file for user preferences
@@ -211,6 +211,15 @@ type InstanceSettings struct {
 	// When false (default), only one instance can run per profile
 	// When true, multiple instances can run, but only the first (primary) manages the notification bar
 	AllowMultiple bool `toml:"allow_multiple"`
+
+	// AttachMode determines how sessions attach (window, popup, etc.)
+	AttachMode string `toml:"attach_mode,omitempty"`
+
+	// PopupWidth sets the width for popup windows
+	PopupWidth int `toml:"popup_width,omitempty"`
+
+	// PopupHeight sets the height for popup windows
+	PopupHeight int `toml:"popup_height,omitempty"`
 }
 
 // ShellSettings defines shell environment configuration for sessions
