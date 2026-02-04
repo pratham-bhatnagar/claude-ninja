@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/asheshgoplani/agent-deck/internal/tmux"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/tmux"
 )
 
 const (

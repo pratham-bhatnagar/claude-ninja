@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/asheshgoplani/agent-deck/internal/clipboard"
-	"github.com/asheshgoplani/agent-deck/internal/profile"
-	"github.com/asheshgoplani/agent-deck/internal/session"
-	"github.com/asheshgoplani/agent-deck/internal/tmux"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/clipboard"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/profile"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/session"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/tmux"
 )
 
 // handleSession dispatches session subcommands

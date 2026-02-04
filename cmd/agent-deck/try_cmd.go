@@ -6,8 +6,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/asheshgoplani/agent-deck/internal/experiments"
-	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/experiments"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/session"
 )
 
 // handleTry handles the 'try' subcommand for quick experiments

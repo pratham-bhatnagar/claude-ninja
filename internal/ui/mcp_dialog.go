@@ -3,7 +3,7 @@ package ui
 import (
 	"log"
 
-	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/session"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )

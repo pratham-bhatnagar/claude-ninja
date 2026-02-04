@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/asheshgoplani/agent-deck/internal/tmux"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/tmux"
 )
 
 // Status represents the current state of a session
@@ -82,6 +82,10 @@ type Instance struct {
 	// ToolOptions stores tool-specific launch options (Claude, Codex, Gemini, etc.)
 	// JSON structure: {"tool": "claude", "options": {...}}
 	ToolOptionsJSON json.RawMessage `json:"tool_options,omitempty"`
+
+	// IsManager indicates if this session is a manager/orchestrator session
+	// Used for sorting and UI display purposes
+	IsManager bool `json:"is_manager,omitempty"`
 
 	tmuxSession *tmux.Session // Internal tmux session
 

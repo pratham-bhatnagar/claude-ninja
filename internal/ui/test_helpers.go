@@ -3,7 +3,7 @@ package ui
 import (
 	"time"
 
-	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/session"
 )
 
 // Test helpers for width_test.go
