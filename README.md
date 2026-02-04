@@ -85,6 +85,7 @@ Ninja planning commands (run from the Orchestrator):
 
 The Orchestrator panel shows your current phase (from `.planning/STATE.md`) and total phases (from `.planning/ROADMAP.md`) so you don’t have to track it manually.
 Phases are simply numbered steps in the roadmap; the UI always shows which step you’re on.
+Claude Ninja now also initializes `.planning/state_machine.json` as the base runtime state model for manager/task/PR lifecycle tracking.
 
 Key shortcuts:
 
@@ -94,6 +95,13 @@ Key shortcuts:
 - `A`: from Orchestrator session, reply to all waiting agents
 - `v`: cycle right pane (Orchestrator / Both / Output / Stats)
 - `Ctrl+M`: jump to Orchestrator session
+- `t`: create/update a task contract for selected session
+- `a`: assign/start selected task
+- `b`: add a blocked question for user input
+- `Shift+B`: mark selected task blocked (waiting input)
+- `Shift+W`: send selected task to review
+- `Shift+T`: mark tests passed + accept task
+- `Shift+P`: advance PR state (branch ready -> open -> reviewed -> merged)
 
 ## State Diagrams (Vision)
 

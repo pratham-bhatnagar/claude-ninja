@@ -127,6 +127,13 @@ func (h *HelpOverlay) View() string {
 				{"F", "Fork with options (Claude only)"},
 				{"c", "Copy output to clipboard"},
 				{"x", "Send output to session"},
+				{"t", "Create/update task contract"},
+				{"a", "Assign/start selected task"},
+				{"b", "Add blocked question for user"},
+				{"Shift+B", "Mark task blocked"},
+				{"Shift+W", "Send task to review"},
+				{"Shift+T", "Mark tests pass + accept"},
+				{"Shift+P", "Advance PR state"},
 			},
 		},
 		{

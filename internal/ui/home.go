@@ -23,6 +23,7 @@ import (
 	"github.com/pratham-bhatnagar/claude-ninja/internal/session"
 	"github.com/pratham-bhatnagar/claude-ninja/internal/tmux"
 	"github.com/pratham-bhatnagar/claude-ninja/internal/update"
+	"github.com/pratham-bhatnagar/claude-ninja/internal/workflow"
 )
 
 // Version is set by main.go for update checking
@@ -3457,6 +3458,276 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case "t":
+		// Create/update task contract for selected session
+		inst := h.getSelectedSession()
+		if inst == nil {
+			h.setError(fmt.Errorf("select a session to create a task"))
+			return h, nil
+		}
+		_, machine, err := h.upsertWorkflowTaskForSession(inst)
+		if err != nil {
+			h.setError(err)
+			return h, nil
+		}
+		if err := workflow.Save(projectKeyForInstance(inst), machine); err != nil {
+			h.setError(err)
+			return h, nil
+		}
+		h.clearError()
+		return h, nil
+
+	case "a":
+		// Assign/start selected task for selected session
+		inst := h.getSelectedSession()
+		if inst == nil {
+			h.setError(fmt.Errorf("select a session to assign task"))
+			return h, nil
+		}
+		contract, machine, err := h.upsertWorkflowTaskForSession(inst)
+		if err != nil {
+			h.setError(err)
+			return h, nil
+		}
+		taskID := contract.ID
+		if machine.Current == workflow.ProjectStateIntake {
+			_ = machine.TransitionProject(workflow.ProjectStatePlanning, "manager", "task assignment")
+		}
+		if machine.Current == workflow.ProjectStatePlanning {
+			_ = machine.TransitionProject(workflow.ProjectStateDecomposed, "manager", "task assignment")
+		}
+		if machine.Current == workflow.ProjectStateDecomposed {
+			_ = machine.TransitionProject(workflow.ProjectStateAssigned, "manager", "task assignment")
+		}
+		if machine.Current == workflow.ProjectStateAssigned {
+			_ = machine.TransitionProject(workflow.ProjectStateExecuting, "manager", "task started")
+		}
+		if machine.Tasks[taskID].State != workflow.TaskStateWorking {
+			if err := machine.TransitionTask(taskID, workflow.TaskStateWorking, "manager", "assigned from UI"); err != nil {
+				h.setError(err)
+				return h, nil
+			}
+		}
+		if _, err := workflow.UpsertTaskContract(projectKeyForInstance(inst), workflow.TaskContract{
+			ID:           taskID,
+			State:        workflow.TaskStateWorking,
+			ReviewStatus: "pending",
+			TestStatus:   "pending",
+		}); err != nil {
+			h.setError(err)
+			return h, nil
+		}
+		if err := workflow.Save(projectKeyForInstance(inst), machine); err != nil {
+			h.setError(err)
+			return h, nil
+		}
+		h.clearError()
+		return h, nil
+
+	case "b":
+		// Add blocked question for selected session (manager can batch these for user input)
+		inst := h.getSelectedSession()
+		if inst == nil {
+			h.setError(fmt.Errorf("select a session to add question"))
+			return h, nil
+		}
+		projectPath := projectKeyForInstance(inst)
+		contract, machine, err := h.upsertWorkflowTaskForSession(inst)
+		if err != nil {
+			h.setError(err)
+			return h, nil
+		}
+		if machine.Tasks[contract.ID].State != workflow.TaskStateWaitingInput {
+			if err := machine.TransitionTask(contract.ID, workflow.TaskStateWaitingInput, "agent", "needs human input"); err != nil {
+				h.setError(err)
+				return h, nil
+			}
+		}
+		summary := h.buildNudgeSummary(inst)
+		question := "Please clarify next action"
+		if strings.TrimSpace(summary) != "" {
+			question = summary
+		}
+		if err := workflow.AddQuestion(projectPath, contract.ID, inst.ID, question); err != nil {
+			h.setError(err)
+			return h, nil
+		}
+		if _, err := workflow.UpsertTaskContract(projectPath, workflow.TaskContract{
+			ID:           contract.ID,
+			State:        workflow.TaskStateWaitingInput,
+			ReviewStatus: "pending",
+		}); err != nil {
+			h.setError(err)
+			return h, nil
+		}
+		if err := workflow.Save(projectPath, machine); err != nil {
+			h.setError(err)
+			return h, nil
+		}
+		h.clearError()
+		return h, nil
+
+	case "B":
+		// Mark selected task blocked (waiting input)
+		inst := h.getSelectedSession()
+		if inst == nil {
+			h.setError(fmt.Errorf("select a session to mark blocked"))
+			return h, nil
+		}
+		contract, machine, err := h.upsertWorkflowTaskForSession(inst)
+		if err != nil {
+			h.setError(err)
+			return h, nil
+		}
+		taskID := contract.ID
+		if machine.Tasks[taskID].State != workflow.TaskStateWaitingInput {
+			if err := machine.TransitionTask(taskID, workflow.TaskStateWaitingInput, "agent", "blocked from UI"); err != nil {
+				h.setError(err)
+				return h, nil
+			}
+		}
+		if _, err := workflow.UpsertTaskContract(projectKeyForInstance(inst), workflow.TaskContract{
+			ID:           taskID,
+			State:        workflow.TaskStateWaitingInput,
+			ReviewStatus: "pending",
+		}); err != nil {
+			h.setError(err)
+			return h, nil
+		}
+		if err := workflow.Save(projectKeyForInstance(inst), machine); err != nil {
+			h.setError(err)
+			return h, nil
+		}
+		h.clearError()
+		return h, nil
+
+	case "W":
+		// Mark selected task ready for review
+		inst := h.getSelectedSession()
+		if inst == nil {
+			h.setError(fmt.Errorf("select a session to request review"))
+			return h, nil
+		}
+		contract, machine, err := h.upsertWorkflowTaskForSession(inst)
+		if err != nil {
+			h.setError(err)
+			return h, nil
+		}
+		taskID := contract.ID
+		if machine.Current == workflow.ProjectStateExecuting {
+			_ = machine.TransitionProject(workflow.ProjectStateReview, "manager", "review requested")
+		}
+		if machine.Tasks[taskID].State != workflow.TaskStateReviewer {
+			if err := machine.TransitionTask(taskID, workflow.TaskStateReviewer, "agent", "ready for review"); err != nil {
+				h.setError(err)
+				return h, nil
+			}
+		}
+		if _, err := workflow.UpsertTaskContract(projectKeyForInstance(inst), workflow.TaskContract{
+			ID:           taskID,
+			State:        workflow.TaskStateReviewer,
+			ReviewStatus: "in_review",
+		}); err != nil {
+			h.setError(err)
+			return h, nil
+		}
+		if err := workflow.Save(projectKeyForInstance(inst), machine); err != nil {
+			h.setError(err)
+			return h, nil
+		}
+		h.clearError()
+		return h, nil
+
+	case "T":
+		// Mark selected task tested and accepted
+		inst := h.getSelectedSession()
+		if inst == nil {
+			h.setError(fmt.Errorf("select a session to mark tested"))
+			return h, nil
+		}
+		contract, machine, err := h.upsertWorkflowTaskForSession(inst)
+		if err != nil {
+			h.setError(err)
+			return h, nil
+		}
+		taskID := contract.ID
+		if machine.Tasks[taskID].State != workflow.TaskStateDone {
+			if err := machine.TransitionTask(taskID, workflow.TaskStateDone, "reviewer", "accepted + tests pass"); err != nil {
+				h.setError(err)
+				return h, nil
+			}
+		}
+		if _, err := workflow.UpsertTaskContract(projectKeyForInstance(inst), workflow.TaskContract{
+			ID:           taskID,
+			State:        workflow.TaskStateDone,
+			ReviewStatus: "approved",
+			TestStatus:   "passed",
+		}); err != nil {
+			h.setError(err)
+			return h, nil
+		}
+		if err := workflow.Save(projectKeyForInstance(inst), machine); err != nil {
+			h.setError(err)
+			return h, nil
+		}
+		h.clearError()
+		return h, nil
+
+	case "P":
+		// Advance PR lifecycle for selected task
+		inst := h.getSelectedSession()
+		if inst == nil {
+			h.setError(fmt.Errorf("select a session to update PR state"))
+			return h, nil
+		}
+		contract, machine, err := h.upsertWorkflowTaskForSession(inst)
+		if err != nil {
+			h.setError(err)
+			return h, nil
+		}
+		taskID := contract.ID
+		current := machine.PRs[taskID]
+		next := workflow.PRStateOpen
+		if current != nil {
+			switch current.State {
+			case workflow.PRStateBranchReady:
+				next = workflow.PRStateOpen
+			case workflow.PRStateOpen:
+				next = workflow.PRStateReviewed
+			case workflow.PRStateReviewed:
+				next = workflow.PRStateMerged
+			case workflow.PRStateMerged:
+				h.setError(fmt.Errorf("pr already merged for %s", taskID))
+				return h, nil
+			}
+		}
+		if err := machine.TransitionPR(taskID, next, "manager", "updated from UI"); err != nil {
+			h.setError(err)
+			return h, nil
+		}
+		if next == workflow.PRStateOpen && machine.Current == workflow.ProjectStateReview {
+			_ = machine.TransitionProject(workflow.ProjectStatePRFlow, "manager", "pr opened")
+		}
+		if next == workflow.PRStateMerged {
+			if machine.Current == workflow.ProjectStatePRFlow {
+				_ = machine.TransitionProject(workflow.ProjectStateMerged, "manager", "pr merged")
+			}
+		}
+		if _, err := workflow.UpsertTaskContract(projectKeyForInstance(inst), workflow.TaskContract{
+			ID:           taskID,
+			PRStatus:     next,
+			ReviewStatus: "approved",
+		}); err != nil {
+			h.setError(err)
+			return h, nil
+		}
+		if err := workflow.Save(projectKeyForInstance(inst), machine); err != nil {
+			h.setError(err)
+			return h, nil
+		}
+		h.clearError()
+		return h, nil
+
 	case "/":
 		// Open global search first if available, otherwise local search
 		if h.globalSearchIndex != nil {
@@ -5159,6 +5430,12 @@ func (h *Home) renderOrchestratorSidePanel(width, height int) string {
 	b.WriteString("\n")
 	b.WriteString(h.renderWaitingList(project.Key, width, 6))
 	b.WriteString("\n\n")
+
+	b.WriteString(renderSectionDivider("Questions For You", width-2))
+	b.WriteString("\n")
+	b.WriteString(h.renderOpenQuestionsList(project.Key, width, 4))
+	b.WriteString("\n\n")
+
 	b.WriteString(renderSectionDivider("Queued Messages", width-2))
 	b.WriteString("\n")
 	b.WriteString(h.renderQueueList(width, 4))
@@ -5214,7 +5491,69 @@ func (h *Home) renderAgentList(width, maxCount int) string {
 	return strings.Join(lines, "\n")
 }
 
+func (h *Home) taskIDForSession(inst *session.Instance) string {
+	if inst == nil {
+		return ""
+	}
+	return workflow.TaskIDForSession(inst.ID, inst.Title)
+}
+
+func (h *Home) upsertWorkflowTaskForSession(inst *session.Instance) (workflow.TaskContract, *workflow.Machine, error) {
+	if inst == nil {
+		return workflow.TaskContract{}, nil, fmt.Errorf("no session selected")
+	}
+	projectPath := projectKeyForInstance(inst)
+	if projectPath == "" || projectPath == "~" {
+		return workflow.TaskContract{}, nil, fmt.Errorf("session has no project path")
+	}
+	if err := workflow.EnsureProjectMachine(projectPath); err != nil {
+		return workflow.TaskContract{}, nil, err
+	}
+	machine, err := workflow.Load(projectPath)
+	if err != nil {
+		return workflow.TaskContract{}, nil, err
+	}
+	taskID := h.taskIDForSession(inst)
+	if _, err := machine.EnsureTask(taskID, inst.Title); err != nil {
+		return workflow.TaskContract{}, nil, err
+	}
+	contract, err := workflow.UpsertTaskContract(projectPath, workflow.TaskContract{
+		ID:         taskID,
+		Title:      inst.Title,
+		AssignedTo: inst.Title,
+		SessionID:  inst.ID,
+		Branch:     inst.WorktreeBranch,
+		Worktree:   inst.WorktreePath,
+		State:      machine.Tasks[taskID].State,
+		PRStatus:   workflow.PRStateBranchReady,
+	})
+	if err != nil {
+		return workflow.TaskContract{}, nil, err
+	}
+	return contract, machine, nil
+}
+
+func (h *Home) renderContractTasks(projectKey string, width, maxCount int) string {
+	contracts, err := workflow.LoadTaskContracts(projectKey)
+	if err != nil || len(contracts) == 0 {
+		return ""
+	}
+	if maxCount > 0 && len(contracts) > maxCount {
+		contracts = contracts[:maxCount]
+	}
+	var lines []string
+	for _, c := range contracts {
+		line := fmt.Sprintf("%s [%s] rv:%s test:%s pr:%s", c.ID, c.State, c.ReviewStatus, c.TestStatus, c.PRStatus)
+		lines = append(lines, truncateLine(line, max(20, width-2)))
+	}
+	return strings.Join(lines, "\n")
+}
+
 func (h *Home) renderTaskList(projectKey string, width, maxCount int) string {
+	if taskView := h.renderContractTasks(projectKey, width, maxCount); taskView != "" {
+		return taskView
+	}
+
 	tasks := h.getProjectTasks(projectKey, maxCount)
 	if len(tasks) == 0 {
 		return lipgloss.NewStyle().Foreground(ColorTextDim).Italic(true).Render("No tasks yet. Add to .planning/TASKS.md")
@@ -5256,6 +5595,26 @@ func (h *Home) renderWaitingList(projectKey string, width, maxCount int) string 
 	for _, inst := range waiting {
 		summary := h.buildNudgeSummary(inst)
 		line := fmt.Sprintf("◐ %s — %s", inst.Title, summary)
+		lines = append(lines, truncateLine(line, max(20, width-2)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (h *Home) renderOpenQuestionsList(projectKey string, width, maxCount int) string {
+	items, err := workflow.LoadOpenQuestions(projectKey)
+	if err != nil || len(items) == 0 {
+		return lipgloss.NewStyle().Foreground(ColorTextDim).Italic(true).Render("No open questions.")
+	}
+	if maxCount > 0 && len(items) > maxCount {
+		items = items[:maxCount]
+	}
+	var lines []string
+	for _, q := range items {
+		task := q.TaskID
+		if task == "" {
+			task = "general"
+		}
+		line := fmt.Sprintf("? %s — %s", task, q.Question)
 		lines = append(lines, truncateLine(line, max(20, width-2)))
 	}
 	return strings.Join(lines, "\n")
@@ -5385,6 +5744,12 @@ func (h *Home) ensurePlanningFiles(projectPath, projectName string) error {
 		return err
 	}
 	if err := writeIfMissing("VERIFICATION.md", "Verification checklist:\n- [ ] Tests pass\n- [ ] Key flows validated\n"); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Join(planningDir, "tasks"), 0755); err != nil {
+		return err
+	}
+	if err := workflow.EnsureProjectMachine(projectPath); err != nil {
 		return err
 	}
 	return nil
@@ -6680,6 +7045,16 @@ func (h *Home) getPhaseSummary(projectKey string) string {
 	if projectKey == "" {
 		return ""
 	}
+	if machine, err := workflow.Load(projectKey); err == nil && machine != nil {
+		progress := machine.Progress()
+		if progress.TasksTotal > 0 {
+			return fmt.Sprintf("%s · %d/%d tasks done", strings.ReplaceAll(string(progress.Current), "_", " "), progress.TasksDone, progress.TasksTotal)
+		}
+		if progress.Current != "" {
+			return strings.ReplaceAll(string(progress.Current), "_", " ")
+		}
+	}
+
 	roadmapPath := filepath.Join(projectKey, ".planning", "ROADMAP.md")
 	statePath := filepath.Join(projectKey, ".planning", "STATE.md")
 
@@ -6710,10 +7085,10 @@ func (h *Home) getPhaseSummary(projectKey string) string {
 	}
 
 	if current != "" && total > 0 {
-		return fmt.Sprintf("Step %s of %d", current, total)
+		return fmt.Sprintf("Phase %s of %d", current, total)
 	}
 	if current != "" {
-		return fmt.Sprintf("Step %s", current)
+		return fmt.Sprintf("Phase %s", current)
 	}
 	if total > 0 {
 		return fmt.Sprintf("%d phases planned", total)
